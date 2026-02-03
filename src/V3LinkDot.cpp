@@ -2530,17 +2530,21 @@ class LinkDotIfaceVisitor final : public VNVisitor {
     }
 
     // Helper to extract a dotted path string from an AstDot tree
-    string extractDottedPath(AstNode* nodep) {
+    // Returns empty string and sets hasPartSelect=true if part-select detected
+    string extractDottedPath(AstNode* nodep, bool& hasPartSelect) {
         if (AstParseRef* const refp = VN_CAST(nodep, ParseRef)) {
             return refp->name();
         } else if (AstVarRef* const refp = VN_CAST(nodep, VarRef)) {
             return refp->name();
         } else if (AstDot* const dotp = VN_CAST(nodep, Dot)) {
-            const string lhs = extractDottedPath(dotp->lhsp());
-            const string rhs = extractDottedPath(dotp->rhsp());
+            const string lhs = extractDottedPath(dotp->lhsp(), hasPartSelect);
+            const string rhs = extractDottedPath(dotp->rhsp(), hasPartSelect);
             if (lhs.empty()) return rhs;
             if (rhs.empty()) return lhs;
             return lhs + "." + rhs;
+        } else if (VN_IS(nodep, SelBit) || VN_IS(nodep, SelExtract)) {
+            hasPartSelect = true;
+            return "";
         }
         return "";
     }
@@ -2563,19 +2567,25 @@ class LinkDotIfaceVisitor final : public VNVisitor {
         } else if (AstVarXRef* const refp = VN_CAST(exprp, VarXRef)) {
             // Resolved VarXRef (dotted reference resolved by earlier pass)
             if (refp->varp()) {
-                symp = m_curSymp->findIdFallback(refp->varp()->name());
+                symp = m_statep->getNodeSym(refp->varp());
             }
         } else if (AstDot* const dotp = VN_CAST(exprp, Dot)) {
             // Dotted path: modport mp(input .a(inner.sig))
             // NOTE: Nested interface paths like base.wr are not yet supported
-            const string dottedPath = extractDottedPath(dotp);
-            string baddot;
-            VSymEnt* okSymp = nullptr;
-            symp = m_statep->findDotted(fl, m_curSymp, dottedPath, baddot, okSymp, true);
-            if (!symp || !baddot.empty()) {
-                fl->v3error("Can't find modport expression target: "
-                            << AstNode::prettyNameQ(dottedPath));
-                symp = nullptr;
+            bool hasPartSelect = false;
+            const string dottedPath = extractDottedPath(dotp, hasPartSelect);
+            if (hasPartSelect) {
+                fl->v3warn(E_UNSUPPORTED,
+                           "Unsupported: Modport expression with part select (IEEE 1800-2023 25.5.4)");
+            } else {
+                string baddot;
+                VSymEnt* okSymp = nullptr;
+                symp = m_statep->findDotted(fl, m_curSymp, dottedPath, baddot, okSymp, true);
+                if (!symp || !baddot.empty()) {
+                    fl->v3error("Can't find modport expression target: "
+                                << AstNode::prettyNameQ(dottedPath));
+                    symp = nullptr;
+                }
             }
         } else if (VN_IS(exprp, SelBit) || VN_IS(exprp, SelExtract)) {
             // Part select expressions not yet supported

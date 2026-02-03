@@ -11,9 +11,12 @@
 
 interface my_if;
   logic sig_a, sig_b, sig_c, sig_d;
+  logic sig_e, sig_f;
 
   modport mp1(input .a(sig_a), output .b(sig_b));
   modport mp2(input .a(sig_c), output .b(sig_d));
+  // Mixed regular and expression items
+  modport mp3(input sig_e, output .f(sig_f));
 endinterface
 
 module mod1 (
@@ -28,17 +31,26 @@ module mod2 (
   assign i.b = i.a;
 endmodule
 
+module mod3 (
+    my_if.mp3 i
+);
+  assign i.f = i.sig_e;  // sig_e is regular, f is expression
+endmodule
+
 module top ();
   my_if myIf ();
   assign myIf.sig_a = 1'b1, myIf.sig_c = 1'b1;
+  assign myIf.sig_e = 1'b1;
 
   mod1 mod1Instance (myIf);
   mod2 mod2Instance (myIf);
+  mod3 mod3Instance (myIf);
 
   initial begin
     #1;
     `checkh(myIf.sig_a, myIf.sig_b);
     `checkh(myIf.sig_c, myIf.sig_d);
+    `checkh(myIf.sig_e, myIf.sig_f);
     #1;
     $write("*-* All Finished *-*\n");
     $finish;
