@@ -2567,6 +2567,7 @@ class LinkDotIfaceVisitor final : public VNVisitor {
             }
         } else if (AstDot* const dotp = VN_CAST(exprp, Dot)) {
             // Dotted path: modport mp(input .a(inner.sig))
+            // NOTE: Nested interface paths like base.wr are not yet supported
             const string dottedPath = extractDottedPath(dotp);
             string baddot;
             VSymEnt* okSymp = nullptr;
@@ -3902,7 +3903,12 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     // Really this is a scope reference into an interface
                     UINFO(9, indent() << "varref-ifaceref " << m_ds.m_dotText << "  " << nodep);
                     m_ds.m_dotText = VString::dot(m_ds.m_dotText, ".", nodep->name());
-                    m_ds.m_dotSymp = m_statep->getNodeSym(ifacerefp->ifaceViaCellp());
+                    // If modport specified, use modport symbol table for lookup of virtual ports
+                    if (ifacerefp->modportp() && m_statep->existsNodeSym(ifacerefp->modportp())) {
+                        m_ds.m_dotSymp = m_statep->getNodeSym(ifacerefp->modportp());
+                    } else {
+                        m_ds.m_dotSymp = m_statep->getNodeSym(ifacerefp->ifaceViaCellp());
+                    }
                     m_ds.m_dotPos = DP_SCOPE;
                     ok = true;
                     AstNode* const newp = new AstVarRef{nodep->fileline(), varp, VAccess::READ};
