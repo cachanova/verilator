@@ -54,6 +54,11 @@ class InstVisitor final : public VNVisitor {
         // PIN(p,expr) -> ASSIGNW(VARXREF(p),expr)    (if sub's input)
         //            or  ASSIGNW(expr,VARXREF(p))    (if sub's output)
         UINFO(4, "   PIN  " << nodep);
+        if (nodep->modVarp() && nodep->modVarp()->isParam()) {
+            // Parameters are handled in V3Param; no pin assignment needed.
+            VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+            return;
+        }
         if (!nodep->user1()) {
             // Simplify it
             V3Inst::pinReconnectSimple(nodep, m_cellp, false);
@@ -378,12 +383,24 @@ private:
                 if (VN_IS(arrselp->fromp(), SliceSel))
                     arrselp->fromp()->v3warn(E_UNSUPPORTED, "Unsupported: interface slices");
                 const AstVarRef* const varrefp = VN_CAST(arrselp->fromp(), VarRef);
-                UASSERT_OBJ(varrefp, arrselp, "No interface varref under array");
-                AstVarXRef* const newp = new AstVarXRef{
-                    nodep->fileline(), varrefp->name() + "__BRA__" + index + "__KET__", "",
-                    VAccess::WRITE};
+                const AstVarXRef* const varxrefp = VN_CAST(arrselp->fromp(), VarXRef);
+                UASSERT_OBJ(varrefp || varxrefp, arrselp, "No interface varref under array");
+                string baseName = varrefp ? varrefp->name() : varxrefp->name();
+                if (VString::endsWith(baseName, "__Viftop")) {
+                    baseName.resize(baseName.size() - (sizeof("__Viftop") - 1));
+                }
+                const string dotted = varrefp ? "" : varxrefp->dotted();
+                AstVarXRef* const newp
+                    = new AstVarXRef{nodep->fileline(), baseName + "__BRA__" + index + "__KET__",
+                                     dotted, VAccess::WRITE};
+                if (varxrefp) {
+                    newp->inlinedDots(varxrefp->inlinedDots());
+                    newp->containsGenBlock(varxrefp->containsGenBlock());
+                    newp->classOrPackagep(varxrefp->classOrPackagep());
+                } else if (varrefp) {
+                    newp->classOrPackagep(varrefp->classOrPackagep());
+                }
                 newp->dtypep(nodep->modVarp()->dtypep());
-                newp->classOrPackagep(varrefp->classOrPackagep());
                 arrselp->addNextHere(newp);
                 VL_DO_DANGLING(arrselp->unlinkFrBack()->deleteTree(), arrselp);
             }
@@ -434,6 +451,7 @@ private:
                 newp->name(newp->name() + "__BRA__" + cvtToStr(i) + "__KET__");
                 // And replace exprp with a new varxref
                 const AstVarRef* varrefp = VN_CAST(newp->exprp(), VarRef);  // Maybe null
+                const AstVarXRef* varxrefp = VN_CAST(newp->exprp(), VarXRef);  // Maybe null
                 int expr_i = i;
                 if (const AstSliceSel* const slicep = VN_CAST(newp->exprp(), SliceSel)) {
                     varrefp = VN_AS(slicep->fromp(), VarRef);
@@ -444,16 +462,31 @@ private:
                         = VN_AS(varrefp->dtypep()->skipRefp(), UnpackArrayDType);
                     UASSERT_OBJ(exprArrp, slicep, "Slice of non-array");
                     expr_i = slice_index + exprArrp->lo();
-                } else if (!varrefp) {
+                } else if (!varrefp && !varxrefp) {
                     newp->exprp()->v3error("Unexpected connection to arrayed port");
-                } else if (const auto* const exprArrp
-                           = VN_CAST(varrefp->dtypep()->skipRefp(), UnpackArrayDType)) {
-                    expr_i = exprArrp->left() + in * exprArrp->declRange().leftToRightInc();
+                } else if (const AstNodeDType* const exprDtypep
+                           = (varrefp ? varrefp->dtypep() : varxrefp->dtypep())) {
+                    if (const auto* const exprArrp
+                        = VN_CAST(exprDtypep->skipRefp(), UnpackArrayDType)) {
+                        expr_i = exprArrp->left() + in * exprArrp->declRange().leftToRightInc();
+                    }
                 }
 
-                const string newname = varrefp->name() + "__BRA__" + cvtToStr(expr_i) + "__KET__";
+                string baseName = varrefp ? varrefp->name() : varxrefp->name();
+                if (VString::endsWith(baseName, "__Viftop")) {
+                    baseName.resize(baseName.size() - (sizeof("__Viftop") - 1));
+                }
+                const string dotted = varrefp ? "" : varxrefp->dotted();
+                const string newname = baseName + "__BRA__" + cvtToStr(expr_i) + "__KET__";
                 AstVarXRef* const newVarXRefp
-                    = new AstVarXRef{nodep->fileline(), newname, "", VAccess::WRITE};
+                    = new AstVarXRef{nodep->fileline(), newname, dotted, VAccess::WRITE};
+                if (varxrefp) {
+                    newVarXRefp->inlinedDots(varxrefp->inlinedDots());
+                    newVarXRefp->containsGenBlock(varxrefp->containsGenBlock());
+                    newVarXRefp->classOrPackagep(varxrefp->classOrPackagep());
+                } else if (varrefp) {
+                    newVarXRefp->classOrPackagep(varrefp->classOrPackagep());
+                }
                 newVarXRefp->varp(newp->modVarp());
                 newp->exprp()->unlinkFrBack()->deleteTree();
                 newp->exprp(newVarXRefp);
