@@ -84,6 +84,27 @@ class ScopeVisitor final : public VNVisitor {
                 }
                 searchScopep = searchScopep->aboveScopep();
             }
+            // For interface variables (e.g., nested interface access), the variable may be
+            // in an interface scope that's not in the parent chain. Try to find it through
+            // the interface type's cell.
+            // The VarScope is registered with the containing interface's scope, which is
+            // the aboveScopep of the nested interface cell's scope.
+            if (!varscp) {
+                if (const AstIfaceRefDType* const ifrefp
+                    = VN_CAST(nodep->varp()->dtypep(), IfaceRefDType)) {
+                    if (ifrefp->cellp()) {
+                        AstScope* const cellScopep = VN_CAST(ifrefp->cellp()->user2p(), Scope);
+                        // The var is registered under the parent scope (containing interface)
+                        AstScope* const parentScopep
+                            = cellScopep ? cellScopep->aboveScopep() : nullptr;
+                        if (parentScopep) {
+                            const auto it3 = m_varScopes.find(
+                                std::make_pair(nodep->varp(), parentScopep));
+                            if (it3 != m_varScopes.end()) varscp = it3->second;
+                        }
+                    }
+                }
+            }
             UASSERT_OBJ(varscp, nodep, "Can't locate varref scope");
             nodep->varScopep(varscp);
         }

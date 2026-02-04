@@ -2475,6 +2475,24 @@ private:
                 if (inl == "") break;
                 inl = LinkDotState::removeLastInlineScope(inl);
             }
+            // For nested interface access, the symbol may not be in the current module.
+            // Try to find it through the var's interface type.
+            if (!symp && refp && refp->varp()) {
+                if (const AstIfaceRefDType* const ifrefp
+                    = VN_CAST(refp->varp()->dtypep(), IfaceRefDType)) {
+                    if (ifrefp->cellp()) {
+                        // Get the parent of the cell (the containing interface)
+                        VSymEnt* const cellSymp = m_statep->getNodeSym(ifrefp->cellp());
+                        if (cellSymp && cellSymp->parentp()) {
+                            string baddot;
+                            VSymEnt* okSymp;
+                            symp = m_statep->findDotted(nodep->rhsp()->fileline(),
+                                                        cellSymp->parentp(), scopename,
+                                                        baddot, okSymp, false);
+                        }
+                    }
+                }
+            }
             if (!symp) {
                 UINFO(9, "No symbol for interface alias rhs ("
                              << std::string{refp ? "VARREF " : "VARXREF "} << scopename << ")");
