@@ -707,6 +707,7 @@ public:
             baddot = ident;  // So user can see where they botched it
             okSymp = lookupSymp;
             string altIdent;
+            string altIdent2;
             if (forPrearray()) {
                 // GENFOR Begin is foo__BRA__##__KET__ after we've genloop unrolled,
                 // but presently should be just "foo".
@@ -714,6 +715,10 @@ public:
                 if ((pos = ident.rfind("__BRA__")) != string::npos) {
                     altIdent = ident.substr(0, pos);
                 }
+            } else if ((pos = ident.rfind("__BRA__")) != string::npos) {
+                // Arrayed interface cells are not expanded into per-index symbols.
+                altIdent = ident.substr(0, pos);
+                altIdent2 = altIdent + "__Viftop";
             }
             UINFO(8, "         id " << ident << " alt " << altIdent << " left " << leftname
                                     << " at se" << lookupSymp);
@@ -727,6 +732,9 @@ public:
                                                    ? VN_CAST(lookupSymp->nodep(), CellInline)
                                                    : nullptr;  // Replicated below
                 VSymEnt* findSymp = findWithAltFallback(lookupSymp, ident, altIdent);
+                if (!findSymp && !altIdent2.empty()) {
+                    findSymp = findWithAltFallback(lookupSymp, altIdent2, "");
+                }
                 if (!findSymp) findSymp = findForkParentAlias(lookupSymp, ident);
                 if (findSymp) lookupSymp = unwrapForkParent(findSymp, ident);
 
@@ -767,6 +775,18 @@ public:
                                     return nullptr;
                                 }
                                 break;
+                            } else if (!altIdent2.empty()) {
+                                if (VSymEnt* const findSym3p
+                                    = findWithAltFallback(lookupSymp, altIdent2, "")) {
+                                    lookupSymp = findSym3p;
+                                    if (crossedCell && VN_IS(lookupSymp->nodep(), Var)) {
+                                        UINFO(9,
+                                              "    Not found but matches var name in parent "
+                                                  << lookupSymp);
+                                        return nullptr;
+                                    }
+                                    break;
+                                }
                             }
                         } else {
                             break;
@@ -776,6 +796,9 @@ public:
                 }
             } else {  // Searching for middle submodule, must be a cell name
                 VSymEnt* findSymp = findWithAltFlat(lookupSymp, ident, altIdent);
+                if (!findSymp && !altIdent2.empty()) {
+                    findSymp = findWithAltFlat(lookupSymp, altIdent2, "");
+                }
                 if (!findSymp) findSymp = findForkParentAlias(lookupSymp, ident);
                 if (findSymp) {
                     lookupSymp = unwrapForkParent(findSymp, ident);
@@ -864,23 +887,70 @@ public:
         // Find symbol in given point in hierarchy, allowing prefix (post-Inline)
         // For simplicity lookupSymp may be passed nullptr result from findDotted
         if (!lookupSymp) return nullptr;
+        auto findWithPrefix = [&](const string& name) -> VSymEnt* {
+            string prefix = lookupSymp->symPrefix();
+            VSymEnt* foundp = nullptr;
+            while (!foundp) {
+                if (fallback) {
+                    foundp = lookupSymp->findIdFallback(prefix + name);  // Might be nullptr
+                } else {
+                    foundp = lookupSymp->findIdFlat(prefix + name);  // Might be nullptr
+                }
+                if (prefix.empty()) break;
+                const string nextPrefix = removeLastInlineScope(prefix);
+                if (prefix == nextPrefix) break;
+                prefix = nextPrefix;
+            }
+            return foundp;
+        };
         UINFO(8, "    findSymPrefixed "
                      << dotname << " under se" << cvtToHex(lookupSymp)
                      << ((lookupSymp->symPrefix() == "") ? "" : " as ")
                      << ((lookupSymp->symPrefix() == "") ? "" : lookupSymp->symPrefix() + dotname)
                      << "  at se" << lookupSymp << " fallback=" << fallback);
-        string prefix = lookupSymp->symPrefix();
-        VSymEnt* foundp = nullptr;
-        while (!foundp) {
-            if (fallback) {
-                foundp = lookupSymp->findIdFallback(prefix + dotname);  // Might be nullptr
-            } else {
-                foundp = lookupSymp->findIdFlat(prefix + dotname);  // Might be nullptr
+        VSymEnt* foundp = findWithPrefix(dotname);
+        const size_t braPos = dotname.rfind("__BRA__");
+        const size_t ketPos = dotname.rfind("__KET__");
+        const bool hasArraySuffix
+            = (braPos != string::npos && ketPos != string::npos && ketPos > braPos);
+        if (foundp && hasArraySuffix) {
+            if (!VN_IS(foundp->nodep(), Var) && !VN_IS(foundp->nodep(), ModportVarRef)
+                && !VN_IS(foundp->nodep(), VarScope)) {
+                foundp = nullptr;
             }
-            if (prefix.empty()) break;
-            const string nextPrefix = removeLastInlineScope(prefix);
-            if (prefix == nextPrefix) break;
-            prefix = nextPrefix;
+        }
+        if (!foundp) {
+            if (hasArraySuffix) {
+                const string baseName = dotname.substr(0, braPos);
+                const string suffix = dotname.substr(braPos);
+                const string viftopArray = baseName + "__Viftop" + suffix;
+                const string baseViftop = baseName + "__Viftop";
+                auto isIfaceArray = [](VSymEnt* symp) -> bool {
+                    if (!symp) return false;
+                    const AstVar* varp = VN_CAST(symp->nodep(), Var);
+                    if (!varp) {
+                        if (const AstVarScope* const vscp = VN_CAST(symp->nodep(), VarScope)) {
+                            varp = vscp->varp();
+                        }
+                    }
+                    if (!varp || !varp->isIfaceRef()) return false;
+                    AstNodeDType* dtypep = varp->subDTypep();
+                    if (!dtypep) dtypep = varp->dtypep();
+                    return LinkDotState::ifaceRefFromArray(dtypep) != nullptr;
+                };
+                if (VSymEnt* const viftopSymp = findWithPrefix(viftopArray)) {
+                    if (VN_IS(viftopSymp->nodep(), Var) || VN_IS(viftopSymp->nodep(), VarScope)
+                        || VN_IS(viftopSymp->nodep(), ModportVarRef)) {
+                        foundp = viftopSymp;
+                        return foundp;
+                    }
+                }
+                VSymEnt* baseSymp = findWithPrefix(baseName);
+                if (!isIfaceArray(baseSymp)) baseSymp = findWithPrefix(baseViftop);
+                if (isIfaceArray(baseSymp)) {
+                    foundp = baseSymp;
+                }
+            }
         }
         if (!foundp) baddot = dotname;
         return foundp;
@@ -2486,6 +2556,38 @@ private:
                 = (xrefp && !xrefp->dotted().empty()) ? (xrefp->dotted() + ".") : "";
             VSymEnt* symp = nullptr;
             string scopename;
+            auto findArrayedScope = [&](const string& name, string& usedName) -> VSymEnt* {
+                static constexpr const char* const BRA = "__BRA__";
+                static constexpr const char* const KET = "__KET__";
+                const size_t ketPos = name.rfind(KET);
+                if (ketPos == string::npos || ketPos + strlen(KET) != name.size()) return nullptr;
+                const size_t braPos = name.rfind(BRA, ketPos);
+                if (braPos == string::npos) return nullptr;
+                const string basePath = name.substr(0, braPos);
+                if (basePath.empty()) return nullptr;
+                string baddot;
+                VSymEnt* okSymp;
+                VSymEnt* baseSymp = m_statep->findDotted(nodep->rhsp()->fileline(), modSymp,
+                                                         basePath, baddot, okSymp, true);
+                if (!baseSymp) return nullptr;
+                const AstVar* varp = VN_CAST(baseSymp->nodep(), Var);
+                if (!varp) {
+                    if (const AstVarScope* const vscp = VN_CAST(baseSymp->nodep(), VarScope)) {
+                        varp = vscp->varp();
+                    }
+                }
+                if (varp && varp->isIfaceRef()) {
+                    if (AstIfaceRefDType* const ifaceRefp
+                        = LinkDotState::ifaceRefFromArray(varp->dtypep())) {
+                        if (ifaceRefp->ifaceViaCellp()
+                            && m_statep->existsNodeSym(ifaceRefp->ifaceViaCellp())) {
+                            baseSymp = m_statep->getNodeSym(ifaceRefp->ifaceViaCellp());
+                        }
+                    }
+                }
+                usedName = basePath;
+                return baseSymp;
+            };
             while (!symp) {
                 scopename = refp ? refp->name()
                                  : (inl.size() ? (inl + dottedPath + xrefp->name())
@@ -2494,6 +2596,13 @@ private:
                 VSymEnt* okSymp;
                 symp = m_statep->findDotted(nodep->rhsp()->fileline(), modSymp, scopename, baddot,
                                             okSymp, true);
+                if (!symp) {
+                    string arrayBase;
+                    if (VSymEnt* const arraySymp = findArrayedScope(scopename, arrayBase)) {
+                        scopename = arrayBase;
+                        symp = arraySymp;
+                    }
+                }
                 if (inl == "") break;
                 inl = LinkDotState::removeLastInlineScope(inl);
             }
@@ -2817,6 +2926,8 @@ class LinkDotResolveVisitor final : public VNVisitor {
             return nullptr;
         } else if (VN_IS(symp->nodep(), Var)) {
             return VN_AS(symp->nodep(), Var);
+        } else if (const AstVarScope* const vscp = VN_CAST(symp->nodep(), VarScope)) {
+            return vscp->varp();
         } else if (VN_IS(symp->nodep(), ModportVarRef)) {
             AstModportVarRef* const snodep = VN_AS(symp->nodep(), ModportVarRef);
             AstVar* const varp = snodep->varp();
@@ -4408,6 +4519,53 @@ class LinkDotResolveVisitor final : public VNVisitor {
                     = foundp ? foundToVarp(foundp, nodep, nodep->access()) : nullptr;
                 nodep->varp(varp);
                 updateVarUse(nodep->varp());
+                if (nodep->varp()) {
+                    const size_t braPos = nodep->name().rfind("__BRA__");
+                    const size_t ketPos = nodep->name().rfind("__KET__");
+                    if (braPos != string::npos && ketPos != string::npos && ketPos > braPos) {
+                        AstNodeDType* dtypep = nodep->varp()->subDTypep();
+                        if (!dtypep) dtypep = nodep->varp()->dtypep();
+                        const auto parseIndex = [](const string& text) -> int64_t {
+                            if (text.rfind("__02D", 0) == 0) {
+                                return -std::stoll(text.substr(5));
+                            }
+                            return std::stoll(text);
+                        };
+                        const AstUnpackArrayDType* const arrp = VN_CAST(dtypep, UnpackArrayDType);
+                        const AstBracketArrayDType* const barrp
+                            = VN_CAST(dtypep, BracketArrayDType);
+                        const AstNodeDType* const subp
+                            = arrp ? arrp->subDTypep() : (barrp ? barrp->subDTypep() : nullptr);
+                        if (subp && VN_IS(subp, IfaceRefDType)) {
+                            const string indexTxt = nodep->name().substr(
+                                braPos + strlen("__BRA__"), ketPos - braPos - strlen("__BRA__"));
+                            const int64_t index = parseIndex(indexTxt);
+                            AstVarXRef* const baseref = new AstVarXRef{
+                                nodep->fileline(), nodep->varp()->name(),
+                                nodep->dotted(), nodep->access()};
+                            baseref->varp(nodep->varp());
+                            baseref->dtypep(dtypep);
+                            baseref->classOrPackagep(nodep->classOrPackagep());
+                            baseref->inlinedDots(nodep->inlinedDots());
+                            baseref->containsGenBlock(nodep->containsGenBlock());
+                            AstArraySel* const selp = new AstArraySel{
+                                nodep->fileline(), baseref,
+                                new AstConst{nodep->fileline(), static_cast<uint32_t>(index)}};
+                            nodep->replaceWith(selp);
+                            VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                            return;
+                        }
+                        if (const AstUnpackArrayDType* const arrp
+                            = VN_CAST(dtypep, UnpackArrayDType)) {
+                            nodep->dtypep(arrp->subDTypep());
+                        } else if (const AstBracketArrayDType* const arrp
+                                   = VN_CAST(dtypep, BracketArrayDType)) {
+                            nodep->dtypep(arrp->subDTypep());
+                        } else if (VN_IS(dtypep, IfaceRefDType)) {
+                            nodep->dtypep(dtypep);
+                        }
+                    }
+                }
                 UINFO(7, indent() << "Resolved " << nodep);  // Also prints varp
                 // If found, check if it's ok to access in case it's in a hier_block
                 if (nodep->varp() && errorHierNonPort(nodep, nodep->varp(), dotSymp)) return;

@@ -1587,6 +1587,7 @@ class TristateVisitor final : public TristateBaseVisitor {
     //     const inout  Spec says illegal
     //     const output Unsupported; Illegal?
     void visit(AstPin* nodep) override {
+        if (nodep->modVarp() && nodep->modVarp()->isParam()) return;
         if (m_graphing) {
             if (nodep->user2() & U2_GRAPHING) return;  // This pin is already expanded
             nodep->user2Or(U2_GRAPHING);
