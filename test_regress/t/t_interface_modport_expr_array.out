@@ -1,4 +1,4 @@
-%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:26:13: Unsupported: Modport expression with part select (IEEE 1800-2023 25.5.4)
+%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:26:13: Unsupported: Part select in dotted modport expression
    26 |     output .ch0_wr(ch[0].wr), input .ch0_rd(ch[0].rd),
       |             ^~~~~~
                     ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
@@ -6,19 +6,19 @@
    26 |     output .ch0_wr(ch[0].wr), input .ch0_rd(ch[0].rd),
       |             ^~~~~~
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:26:38: Unsupported: Modport expression with part select (IEEE 1800-2023 25.5.4)
+%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:26:38: Unsupported: Part select in dotted modport expression
    26 |     output .ch0_wr(ch[0].wr), input .ch0_rd(ch[0].rd),
       |                                      ^~~~~~
 %Error: t/t_interface_modport_expr_array.v:26:38: Modport item not found: 'ch0_rd'
    26 |     output .ch0_wr(ch[0].wr), input .ch0_rd(ch[0].rd),
       |                                      ^~~~~~
-%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:27:13: Unsupported: Modport expression with part select (IEEE 1800-2023 25.5.4)
+%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:27:13: Unsupported: Part select in dotted modport expression
    27 |     output .ch1_wr(ch[1].wr), input .ch1_rd(ch[1].rd)
       |             ^~~~~~
 %Error: t/t_interface_modport_expr_array.v:27:13: Modport item not found: 'ch1_wr'
    27 |     output .ch1_wr(ch[1].wr), input .ch1_rd(ch[1].rd)
       |             ^~~~~~
-%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:27:38: Unsupported: Modport expression with part select (IEEE 1800-2023 25.5.4)
+%Error-UNSUPPORTED: t/t_interface_modport_expr_array.v:27:38: Unsupported: Part select in dotted modport expression
    27 |     output .ch1_wr(ch[1].wr), input .ch1_rd(ch[1].rd)
       |                                      ^~~~~~
 %Error: t/t_interface_modport_expr_array.v:27:38: Modport item not found: 'ch1_rd'
