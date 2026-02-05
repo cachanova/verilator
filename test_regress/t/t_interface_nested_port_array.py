@@ -9,11 +9,13 @@
 
 import vltest_bootstrap
 
-test.scenarios('linter')
+test.scenarios('simulator')
 
 # Issue #5066: Nested interface ports through interface arrays
 # (e.g., l2.l1[0] where l1 is an interface array inside interface l2).
 # Support for array element interface connections is now implemented.
-test.lint()
+test.compile(verilator_flags2=['--binary'])
+
+test.execute()
 
 test.passes()

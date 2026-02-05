@@ -9,12 +9,14 @@
 
 import vltest_bootstrap
 
-test.scenarios('linter')
+test.scenarios('simulator')
 test.top_filename = "t/t_interface_nested_port_array.v"
 
 # Issue #5066: Nested interface ports through interface arrays
 # (e.g., l2.l1[0] where l1 is an interface array inside interface l2).
-# Support for array element interface connections is now implemented.
-test.lint()
+# Test that -fno-inline works correctly with nested interface array ports.
+test.compile(verilator_flags2=['--binary', '-fno-inline'])
+
+test.execute()
 
 test.passes()
