@@ -72,6 +72,30 @@
 VL_DEFINE_DEBUG_FUNCTIONS;
 
 //######################################################################
+// Static helper to find a variable by name in a module's statements
+
+static const AstVar* findVarByNameInModule(const AstNodeModule* modp, const string& name) {
+    if (!modp) return nullptr;
+    for (AstNode* stmtp = modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+        if (const AstVar* const varp = VN_CAST(stmtp, Var)) {
+            if (varp->name() == name) return varp;
+        }
+    }
+    return nullptr;
+}
+
+// If an unpacked/bracket array, return the subDTypep under it
+static AstNodeDType* arraySubDTypep(AstNodeDType* nodep) {
+    if (const AstUnpackArrayDType* const adtypep = VN_CAST(nodep, UnpackArrayDType)) {
+        return adtypep->subDTypep();
+    }
+    if (const AstBracketArrayDType* const adtypep = VN_CAST(nodep, BracketArrayDType)) {
+        return adtypep->subDTypep();
+    }
+    return nullptr;
+}
+
+//######################################################################
 // Hierarchical block and parameter db (modules without parameters are also handled)
 
 class ParameterizedHierBlocks final {
@@ -870,6 +894,10 @@ class ParamProcessor final {
             UINFO(8, "     IfaceClo " << cloneIrefp);
             cloneIrefp->ifacep(pinIrefp->ifaceViaCellp());
             UINFO(8, "     IfaceNew " << cloneIrefp);
+            if (cloneIrefp->paramsp() && cloneIrefp->ifacep()) {
+                // Ensure interface parameter pins point at the specialized interface params.
+                relinkPinsByName(cloneIrefp->paramsp(), cloneIrefp->ifacep());
+            }
         }
 
         // Fix VarXRefs that reference variables in old interfaces.
@@ -1077,6 +1105,16 @@ class ParamProcessor final {
 
     void cellInterfaceCleanup(AstPin* pinsp, AstNodeModule* srcModp, string& longnamer,
                               bool& any_overridesr, IfaceRefRefs& ifaceRefRefs) {
+        auto findVarByName = [](const AstNodeModule* modp, const string& name) -> const AstVar* {
+            const AstVar* varp = findVarByNameInModule(modp, name);
+            if (varp) return varp;
+            const string viftopSuffix = "__Viftop";
+            if (VString::endsWith(name, viftopSuffix)) {
+                return findVarByNameInModule(modp,
+                                             name.substr(0, name.size() - viftopSuffix.size()));
+            }
+            return findVarByNameInModule(modp, name + viftopSuffix);
+        };
         for (AstPin* pinp = pinsp; pinp; pinp = VN_AS(pinp->nextp(), Pin)) {
             const AstVar* const modvarp = pinp->modVarp();
             if (modvarp && VN_IS(modvarp->subDTypep(), IfaceGenericDType)) continue;
@@ -1106,12 +1144,93 @@ class ParamProcessor final {
                         = VN_AS(arraySubDTypep(VN_AS(exprp->op1p(), VarRef)->varp()->subDTypep()),
                                 IfaceRefDType);
                 } else if (VN_IS(exprp, CellArrayRef)) {
-                    // Interface array element selection (e.g., l1(l2.l1[0]) for nested iface
-                    // array) The CellArrayRef is not yet fully linked to an interface type. Skip
-                    // interface cleanup for this pin - V3LinkDot will resolve this later. Just
-                    // continue to the next pin without error.
-                    UINFO(9, "Skipping interface cleanup for CellArrayRef pin: " << pinp << endl);
-                    continue;
+                    // Interface array element selection (e.g., l1(l2.l1[0]) for nested iface array)
+                    // Try to map the CellArrayRef to the parent interface array var.
+                    const AstCellArrayRef* const cellArrayRefp = VN_AS(exprp, CellArrayRef);
+                    const string& cellName = cellArrayRefp->name();
+                    const AstVar* foundVarp = nullptr;
+                    foundVarp = findVarByName(m_modp, cellName);
+                    if (!foundVarp && m_modp) {
+                        for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                            const AstVar* const portVarp = VN_CAST(stmtp, Var);
+                            if (!portVarp || !portVarp->isIfaceRef()) continue;
+                            if (portVarp->pinNum() == 0 && !portVarp->isIO()) continue;
+                            AstIfaceRefDType* portIrefp
+                                = VN_CAST(portVarp->subDTypep(), IfaceRefDType);
+                            if (!portIrefp && arraySubDTypep(portVarp->subDTypep())) {
+                                portIrefp = VN_CAST(arraySubDTypep(portVarp->subDTypep()),
+                                                    IfaceRefDType);
+                            }
+                            if (!portIrefp) continue;
+                            const AstNodeModule* ifaceModp = portIrefp->ifaceViaCellp();
+                            if (!ifaceModp) ifaceModp = portIrefp->ifacep();
+                            foundVarp = findVarByName(ifaceModp, cellName);
+                            if (foundVarp) break;
+                        }
+                    }
+                    if (!foundVarp) {
+                        // The CellArrayRef is not yet fully linked to an interface type.
+                        // Skip interface cleanup for this pin - V3LinkDot will resolve this later.
+                        UINFO(9,
+                              "Skipping interface cleanup for CellArrayRef pin: " << pinp << endl);
+                        continue;
+                    }
+                    if (AstIfaceRefDType* const refp
+                        = VN_CAST(foundVarp->subDTypep(), IfaceRefDType)) {
+                        pinIrefp = refp;
+                    } else if (foundVarp->subDTypep()
+                               && arraySubDTypep(foundVarp->subDTypep())
+                               && VN_CAST(arraySubDTypep(foundVarp->subDTypep()), IfaceRefDType)) {
+                        pinIrefp = VN_AS(arraySubDTypep(foundVarp->subDTypep()),
+                                         IfaceRefDType);
+                    }
+                } else if (const AstVarXRef* const xrefp = VN_CAST(exprp, VarXRef)) {
+                    const string& dotted = xrefp->dotted();
+                    if (!dotted.empty() && m_modp) {
+                        const size_t dotPos = dotted.find('.');
+                        const string portName
+                            = dotPos == string::npos ? dotted : dotted.substr(0, dotPos);
+                        const AstVar* portVarp = nullptr;
+                        for (AstNode* stmtp = m_modp->stmtsp(); stmtp;
+                             stmtp = stmtp->nextp()) {
+                            const AstVar* const varp = VN_CAST(stmtp, Var);
+                            if (varp && varp->name() == portName) {
+                                portVarp = varp;
+                                break;
+                            }
+                        }
+                        const string& name = xrefp->name();
+                        string baseName = name;
+                        if (const size_t braPos = baseName.find("__BRA__");
+                            braPos != string::npos) {
+                            baseName = baseName.substr(0, braPos);
+                        }
+                        if (portVarp && portVarp->isIfaceRef()) {
+                            AstIfaceRefDType* portIrefp
+                                = VN_CAST(portVarp->subDTypep(), IfaceRefDType);
+                            if (!portIrefp && arraySubDTypep(portVarp->subDTypep())) {
+                                portIrefp = VN_CAST(arraySubDTypep(portVarp->subDTypep()),
+                                                    IfaceRefDType);
+                            }
+                            if (portIrefp) {
+                                const AstNodeModule* ifaceModp = portIrefp->ifaceViaCellp();
+                                if (!ifaceModp) ifaceModp = portIrefp->ifacep();
+                                if (const AstVar* const foundVarp
+                                    = findVarByName(ifaceModp, baseName)) {
+                                    if (AstIfaceRefDType* const refp = VN_CAST(
+                                            foundVarp->subDTypep(), IfaceRefDType)) {
+                                        pinIrefp = refp;
+                                    } else if (foundVarp->subDTypep()
+                                               && arraySubDTypep(foundVarp->subDTypep())
+                                               && VN_CAST(arraySubDTypep(foundVarp->subDTypep()),
+                                                          IfaceRefDType)) {
+                                        pinIrefp = VN_AS(arraySubDTypep(foundVarp->subDTypep()),
+                                                         IfaceRefDType);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 UINFO(9, "     portIfaceRef " << portIrefp);
@@ -1565,6 +1684,7 @@ class ParamVisitor final : public VNVisitor {
     std::deque<std::string> m_strings;  // Allocator for temporary strings
     std::map<const AstRefDType*, bool>
         m_isCircular;  // Stores information whether `AstRefDType` is circular
+    std::unordered_set<AstIfaceRefDType*> m_ifacePortDTypes;  // Interface port dtypes in module
 
     // STATE - for current visit position (use VL_RESTORER)
     AstNodeModule* m_modp = nullptr;  // Module iterating
@@ -1573,6 +1693,10 @@ class ParamVisitor final : public VNVisitor {
     string m_generateHierName;  // Generate portion of hierarchy name
 
     // METHODS
+    bool isIfacePortVar(const AstVar* const varp) const {
+        // Interface ports have no direction set, so use pinNum() to detect them.
+        return varp && varp->isIfaceRef() && (varp->isIO() || varp->pinNum() != 0);
+    }
 
     void processWorkQ() {
         UASSERT(!m_iterateModule, "Should not nest");
@@ -1812,7 +1936,28 @@ class ParamVisitor final : public VNVisitor {
         visitCellOrClassRef(nodep, VN_IS(nodep->modp(), Iface));
     }
     void visit(AstIfaceRefDType* nodep) override {
-        if (nodep->ifacep()) visitCellOrClassRef(nodep, true);
+        if (nodep->ifacep()) {
+            // Port dtypes are relinked via cellInterfaceCleanup; avoid double-parameterization.
+            if (m_ifacePortDTypes.find(nodep) != m_ifacePortDTypes.end()) return;
+            if (m_modp) {
+                for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                    const AstVar* const varp = VN_CAST(stmtp, Var);
+                    if (!isIfacePortVar(varp)) continue;
+                    if (varp->subDTypep() == nodep) return;
+                    if (AstNodeDType* const subp = arraySubDTypep(varp->subDTypep())) {
+                        if (subp == nodep) return;
+                    }
+                }
+            }
+            for (AstNode* up = nodep->backp(); up; up = up->backp()) {
+                if (const AstVar* const varp = VN_CAST(up, Var)) {
+                    if (isIfacePortVar(varp)) return;
+                    break;
+                }
+                if (VN_IS(up, NodeModule) || VN_IS(up, Package)) break;
+            }
+            visitCellOrClassRef(nodep, true);
+        }
     }
     void visit(AstClassRefDType* nodep) override {
         checkParamNotHier(nodep->paramsp());
@@ -1829,7 +1974,16 @@ class ParamVisitor final : public VNVisitor {
     void visit(AstVar* nodep) override {
         if (nodep->user2SetOnce()) return;  // Process once
         // Build cache of interface port names as we encounter them
-        if (nodep->isIfaceRef()) { m_ifacePortNames.insert(nodep->name()); }
+        if (isIfacePortVar(nodep)) { m_ifacePortNames.insert(nodep->name()); }
+        if (isIfacePortVar(nodep)) {
+            if (AstIfaceRefDType* const ifrefp = VN_CAST(nodep->subDTypep(), IfaceRefDType)) {
+                m_ifacePortDTypes.insert(ifrefp);
+            } else if (AstNodeDType* const subp = arraySubDTypep(nodep->subDTypep())) {
+                if (AstIfaceRefDType* const ifrefp = VN_CAST(subp, IfaceRefDType)) {
+                    m_ifacePortDTypes.insert(ifrefp);
+                }
+            }
+        }
         iterateChildren(nodep);
         if (nodep->isParam()) {
             checkParamNotHier(nodep->valuep());
@@ -1984,6 +2138,37 @@ class ParamVisitor final : public VNVisitor {
             // In such cases, m_unlinkedTxt won't contain the expected pattern.
             // Simply skip the replacement - the cell array ref will be resolved later.
             if (pos == string::npos) {
+                if (m_modp) {
+                    const string elementName = baseName + "__BRA__" + index + "__KET__";
+                    for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                        const AstVar* const portVarp = VN_CAST(stmtp, Var);
+                        if (!isIfacePortVar(portVarp)) continue;
+                        AstIfaceRefDType* portIrefp
+                            = VN_CAST(portVarp->subDTypep(), IfaceRefDType);
+                        if (!portIrefp && arraySubDTypep(portVarp->subDTypep())) {
+                            portIrefp = VN_CAST(arraySubDTypep(portVarp->subDTypep()),
+                                                IfaceRefDType);
+                        }
+                        if (!portIrefp) continue;
+                        const AstNodeModule* ifaceModp = portIrefp->ifaceViaCellp();
+                        if (!ifaceModp) ifaceModp = portIrefp->ifacep();
+                        if (!ifaceModp) continue;
+                        const AstVar* matchp = findVarByNameInModule(ifaceModp, nodep->name());
+                        if (!matchp) {
+                            matchp = findVarByNameInModule(ifaceModp, baseName);
+                            if (!matchp) {
+                                matchp = findVarByNameInModule(ifaceModp, baseName + viftopSuffix);
+                            }
+                        }
+                        if (!matchp) continue;
+                        AstVarXRef* const newp
+                            = new AstVarXRef{nodep->fileline(), elementName,
+                                             portVarp->name(), VAccess::READ};
+                        nodep->replaceWith(newp);
+                        VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                        return;
+                    }
+                }
                 UINFO(9, "Skipping unlinked text replacement for " << nodep << endl);
                 return;
             }
