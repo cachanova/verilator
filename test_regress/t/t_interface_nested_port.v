@@ -5,16 +5,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 // Issue #5066 - Combined test for nested interface ports with parameters
+// Issue #6998 - Extended to include interface arrays
 //
-// Tests all parameter patterns in a 5-deep hierarchy:
+// Tests all parameter patterns in a 5-deep hierarchy with both scalar and array interfaces:
 //   - Derived:     W doubles at each level (L3=L4*2, L2A=L3*2, L1=L2*2)
 //   - Hard-coded:  L2B.W=8 regardless of parent
 //   - Passthrough: L0A_W flows unchanged from top to L0A
 //   - Default:     L0B uses default W=8
+//   - Arrays:      Various array sizes [1:0], [0:0], [2:0]
 //
 // With TOP_W=4, L0A_W=16:
 //   L4(W=4) -> L3(W=8) -> L2A(W=16) -> L1(W=32) -> L0A(W=16), L0B(W=8)
 //                      -> L2B(W=8)  -> L1(W=16) -> L0A(W=16), L0B(W=8)
+//
+// Additionally tests:
+//   - Interface arrays as sub-interfaces (l0arr[1:0], l0single[0:0], l0triple[2:0])
+//   - Module ports accepting interface arrays
 
 interface l0_if #(parameter int W = 8);
   logic [W-1:0] tb_in;
@@ -24,8 +30,11 @@ endinterface
 interface l1_if #(parameter int W = 8, parameter int L0A_W = 8);
   logic [W-1:0] tb_in;
   logic [W-1:0] dut_out;
-  l0_if #(L0A_W) l0a();  // passthrough
-  l0_if          l0b();  // default
+  l0_if #(L0A_W) l0a();              // scalar passthrough
+  l0_if          l0b();              // scalar default
+  l0_if #(L0A_W) l0arr[1:0]();       // 2-element array
+  l0_if #(L0A_W) l0single[0:0]();    // single-element array
+  l0_if #(L0A_W) l0triple[2:0]();    // 3-element array
 endinterface
 
 interface l2_if #(parameter int W = 8, parameter int L0A_W = 8);
@@ -77,15 +86,34 @@ module l1_handler #(parameter int W = 8, parameter int L0A_W = 8)(
   l1_if                    l1,
   output logic [W-1:0]     l1_dout,
   output logic [L0A_W-1:0] l0a_dout,
-  output logic [7:0]       l0b_dout
+  output logic [7:0]       l0b_dout,
+  // Array outputs
+  output logic [L0A_W-1:0] l0arr0_dout,
+  output logic [L0A_W-1:0] l0arr1_dout,
+  output logic [L0A_W-1:0] l0single_dout,
+  output logic [L0A_W-1:0] l0triple0_dout,
+  output logic [L0A_W-1:0] l0triple1_dout,
+  output logic [L0A_W-1:0] l0triple2_dout
 );
   // Use reader/driver submodules instead of direct access
   l1_reader #(W) m_rdr (.l1(l1), .dout(l1_dout));
   l1_driver #(W) m_drv (.clk(clk), .l1(l1));
 
-  // Still instantiate l0_handlers for nested ports
+  // Scalar nested ports
   l0_handler #(L0A_W) m_l0a (.clk(clk), .l0(l1.l0a), .dout(l0a_dout));
   l0_handler #(8)     m_l0b (.clk(clk), .l0(l1.l0b), .dout(l0b_dout));
+
+  // Array nested ports - 2-element array
+  l0_handler #(L0A_W) m_l0arr0 (.clk(clk), .l0(l1.l0arr[0]), .dout(l0arr0_dout));
+  l0_handler #(L0A_W) m_l0arr1 (.clk(clk), .l0(l1.l0arr[1]), .dout(l0arr1_dout));
+
+  // Single-element array
+  l0_handler #(L0A_W) m_l0single (.clk(clk), .l0(l1.l0single[0]), .dout(l0single_dout));
+
+  // 3-element array
+  l0_handler #(L0A_W) m_l0triple0 (.clk(clk), .l0(l1.l0triple[0]), .dout(l0triple0_dout));
+  l0_handler #(L0A_W) m_l0triple1 (.clk(clk), .l0(l1.l0triple[1]), .dout(l0triple1_dout));
+  l0_handler #(L0A_W) m_l0triple2 (.clk(clk), .l0(l1.l0triple[2]), .dout(l0triple2_dout));
 endmodule
 
 module l2_handler #(parameter int W = 8, parameter int L0A_W = 8)(
@@ -94,13 +122,24 @@ module l2_handler #(parameter int W = 8, parameter int L0A_W = 8)(
   output logic [W-1:0]     l2_dout,
   output logic [W*2-1:0]   l1_dout,
   output logic [L0A_W-1:0] l0a_dout,
-  output logic [7:0]       l0b_dout
+  output logic [7:0]       l0b_dout,
+  // Array outputs
+  output logic [L0A_W-1:0] l0arr0_dout,
+  output logic [L0A_W-1:0] l0arr1_dout,
+  output logic [L0A_W-1:0] l0single_dout,
+  output logic [L0A_W-1:0] l0triple0_dout,
+  output logic [L0A_W-1:0] l0triple1_dout,
+  output logic [L0A_W-1:0] l0triple2_dout
 );
   always_ff @(posedge clk) l2.dut_out <= l2.tb_in ^ W'('1);
   assign l2_dout = l2.dut_out;
   l1_handler #(W*2, L0A_W) m_l1 (
     .clk(clk), .l1(l2.l1),
-    .l1_dout(l1_dout), .l0a_dout(l0a_dout), .l0b_dout(l0b_dout)
+    .l1_dout(l1_dout), .l0a_dout(l0a_dout), .l0b_dout(l0b_dout),
+    .l0arr0_dout(l0arr0_dout), .l0arr1_dout(l0arr1_dout),
+    .l0single_dout(l0single_dout),
+    .l0triple0_dout(l0triple0_dout), .l0triple1_dout(l0triple1_dout),
+    .l0triple2_dout(l0triple2_dout)
   );
 endmodule
 
@@ -122,29 +161,47 @@ module l3_handler #(parameter int W = 8, parameter int L0A_W = 8)(
   input  logic             clk,
   l3_if                    l3,
   output logic [W-1:0]     l3_dout,
+  // l2a branch outputs
   output logic [W*2-1:0]   l2a_dout,
   output logic [W*4-1:0]   l1_2a_dout,
   output logic [L0A_W-1:0] l0a_2a_dout,
   output logic [7:0]       l0b_2a_dout,
+  output logic [L0A_W-1:0] l0arr0_2a_dout,
+  output logic [L0A_W-1:0] l0arr1_2a_dout,
+  output logic [L0A_W-1:0] l0single_2a_dout,
+  output logic [L0A_W-1:0] l0triple2_2a_dout,
+  // l2b branch outputs
   output logic [7:0]       l2b_dout,
   output logic [15:0]      l1_2b_dout,
   output logic [L0A_W-1:0] l0a_2b_dout,
-  output logic [7:0]       l0b_2b_dout
+  output logic [7:0]       l0b_2b_dout,
+  output logic [L0A_W-1:0] l0arr0_2b_dout,
+  output logic [L0A_W-1:0] l0arr1_2b_dout,
+  output logic [L0A_W-1:0] l0single_2b_dout,
+  output logic [L0A_W-1:0] l0triple2_2b_dout
 );
   // Use reader/driver submodules instead of direct access
   l3_reader #(W) m_rdr (.l3(l3), .dout(l3_dout));
   l3_driver #(W) m_drv (.clk(clk), .l3(l3));
 
-  // Still instantiate l2_handlers for nested ports
+  // l2a branch (derived W*2)
   l2_handler #(W*2, L0A_W) m_l2a (
     .clk(clk), .l2(l3.l2a),
     .l2_dout(l2a_dout), .l1_dout(l1_2a_dout),
-    .l0a_dout(l0a_2a_dout), .l0b_dout(l0b_2a_dout)
+    .l0a_dout(l0a_2a_dout), .l0b_dout(l0b_2a_dout),
+    .l0arr0_dout(l0arr0_2a_dout), .l0arr1_dout(l0arr1_2a_dout),
+    .l0single_dout(l0single_2a_dout),
+    .l0triple0_dout(), .l0triple1_dout(), .l0triple2_dout(l0triple2_2a_dout)
   );
+
+  // l2b branch (hard-coded W=8)
   l2_handler #(8, L0A_W) m_l2b (
     .clk(clk), .l2(l3.l2b),
     .l2_dout(l2b_dout), .l1_dout(l1_2b_dout),
-    .l0a_dout(l0a_2b_dout), .l0b_dout(l0b_2b_dout)
+    .l0a_dout(l0a_2b_dout), .l0b_dout(l0b_2b_dout),
+    .l0arr0_dout(l0arr0_2b_dout), .l0arr1_dout(l0arr1_2b_dout),
+    .l0single_dout(l0single_2b_dout),
+    .l0triple0_dout(), .l0triple1_dout(), .l0triple2_dout(l0triple2_2b_dout)
   );
 endmodule
 
@@ -153,14 +210,24 @@ module l4_handler #(parameter int W = 8, parameter int L0A_W = 8)(
   l4_if                    l4,
   output logic [W-1:0]     l4_dout,
   output logic [W*2-1:0]   l3_dout,
+  // l2a branch outputs
   output logic [W*4-1:0]   l2a_dout,
   output logic [W*8-1:0]   l1_2a_dout,
   output logic [L0A_W-1:0] l0a_2a_dout,
   output logic [7:0]       l0b_2a_dout,
+  output logic [L0A_W-1:0] l0arr0_2a_dout,
+  output logic [L0A_W-1:0] l0arr1_2a_dout,
+  output logic [L0A_W-1:0] l0single_2a_dout,
+  output logic [L0A_W-1:0] l0triple2_2a_dout,
+  // l2b branch outputs
   output logic [7:0]       l2b_dout,
   output logic [15:0]      l1_2b_dout,
   output logic [L0A_W-1:0] l0a_2b_dout,
-  output logic [7:0]       l0b_2b_dout
+  output logic [7:0]       l0b_2b_dout,
+  output logic [L0A_W-1:0] l0arr0_2b_dout,
+  output logic [L0A_W-1:0] l0arr1_2b_dout,
+  output logic [L0A_W-1:0] l0single_2b_dout,
+  output logic [L0A_W-1:0] l0triple2_2b_dout
 );
   always_ff @(posedge clk) l4.dut_out <= l4.tb_in ^ W'('1);
   assign l4_dout = l4.dut_out;
@@ -169,8 +236,12 @@ module l4_handler #(parameter int W = 8, parameter int L0A_W = 8)(
     .l3_dout(l3_dout),
     .l2a_dout(l2a_dout), .l1_2a_dout(l1_2a_dout),
     .l0a_2a_dout(l0a_2a_dout), .l0b_2a_dout(l0b_2a_dout),
+    .l0arr0_2a_dout(l0arr0_2a_dout), .l0arr1_2a_dout(l0arr1_2a_dout),
+    .l0single_2a_dout(l0single_2a_dout), .l0triple2_2a_dout(l0triple2_2a_dout),
     .l2b_dout(l2b_dout), .l1_2b_dout(l1_2b_dout),
-    .l0a_2b_dout(l0a_2b_dout), .l0b_2b_dout(l0b_2b_dout)
+    .l0a_2b_dout(l0a_2b_dout), .l0b_2b_dout(l0b_2b_dout),
+    .l0arr0_2b_dout(l0arr0_2b_dout), .l0arr1_2b_dout(l0arr1_2b_dout),
+    .l0single_2b_dout(l0single_2b_dout), .l0triple2_2b_dout(l0triple2_2b_dout)
   );
 endmodule
 
@@ -183,6 +254,7 @@ module t;
 
   l4_if #(TOP_W, L0A_W) inst();
 
+  // Scalar outputs
   logic [TOP_W-1:0]   l4_dout;
   logic [TOP_W*2-1:0] l3_dout;
   logic [TOP_W*4-1:0] l2a_dout;
@@ -194,19 +266,36 @@ module t;
   logic [L0A_W-1:0]   l0a_2b_dout;
   logic [7:0]         l0b_2b_dout;
 
+  // Array outputs (from l2a branch)
+  logic [L0A_W-1:0]   l0arr0_2a_dout;
+  logic [L0A_W-1:0]   l0arr1_2a_dout;
+  logic [L0A_W-1:0]   l0single_2a_dout;
+  logic [L0A_W-1:0]   l0triple2_2a_dout;
+
+  // Array outputs (from l2b branch)
+  logic [L0A_W-1:0]   l0arr0_2b_dout;
+  logic [L0A_W-1:0]   l0arr1_2b_dout;
+  logic [L0A_W-1:0]   l0single_2b_dout;
+  logic [L0A_W-1:0]   l0triple2_2b_dout;
+
   l4_handler #(TOP_W, L0A_W) m_l4 (
     .clk(clk), .l4(inst),
     .l4_dout(l4_dout),
     .l3_dout(l3_dout),
     .l2a_dout(l2a_dout), .l1_2a_dout(l1_2a_dout),
     .l0a_2a_dout(l0a_2a_dout), .l0b_2a_dout(l0b_2a_dout),
+    .l0arr0_2a_dout(l0arr0_2a_dout), .l0arr1_2a_dout(l0arr1_2a_dout),
+    .l0single_2a_dout(l0single_2a_dout), .l0triple2_2a_dout(l0triple2_2a_dout),
     .l2b_dout(l2b_dout), .l1_2b_dout(l1_2b_dout),
-    .l0a_2b_dout(l0a_2b_dout), .l0b_2b_dout(l0b_2b_dout)
+    .l0a_2b_dout(l0a_2b_dout), .l0b_2b_dout(l0b_2b_dout),
+    .l0arr0_2b_dout(l0arr0_2b_dout), .l0arr1_2b_dout(l0arr1_2b_dout),
+    .l0single_2b_dout(l0single_2b_dout), .l0triple2_2b_dout(l0triple2_2b_dout)
   );
 
   always #5 clk = ~clk;
 
   always_ff @(posedge clk) begin
+    // Scalar inputs
     inst.tb_in               <= cyc[TOP_W-1:0];
     inst.l3.tb_in            <= cyc[TOP_W*2-1:0] + (TOP_W*2)'(1);
     inst.l3.l2a.tb_in        <= cyc[TOP_W*4-1:0] + (TOP_W*4)'(2);
@@ -217,8 +306,21 @@ module t;
     inst.l3.l2b.l1.tb_in     <= cyc[15:0] + 16'd7;
     inst.l3.l2b.l1.l0a.tb_in <= cyc[L0A_W-1:0] + L0A_W'(8);
     inst.l3.l2b.l1.l0b.tb_in <= cyc[7:0] + 8'd9;
+
+    // Array inputs (l2a branch)
+    inst.l3.l2a.l1.l0arr[0].tb_in   <= cyc[L0A_W-1:0] + L0A_W'(10);
+    inst.l3.l2a.l1.l0arr[1].tb_in   <= cyc[L0A_W-1:0] + L0A_W'(11);
+    inst.l3.l2a.l1.l0single[0].tb_in <= cyc[L0A_W-1:0] + L0A_W'(12);
+    inst.l3.l2a.l1.l0triple[2].tb_in <= cyc[L0A_W-1:0] + L0A_W'(13);
+
+    // Array inputs (l2b branch)
+    inst.l3.l2b.l1.l0arr[0].tb_in   <= cyc[L0A_W-1:0] + L0A_W'(14);
+    inst.l3.l2b.l1.l0arr[1].tb_in   <= cyc[L0A_W-1:0] + L0A_W'(15);
+    inst.l3.l2b.l1.l0single[0].tb_in <= cyc[L0A_W-1:0] + L0A_W'(16);
+    inst.l3.l2b.l1.l0triple[2].tb_in <= cyc[L0A_W-1:0] + L0A_W'(17);
   end
 
+  // Expected values
   logic [TOP_W-1:0]   exp_l4;
   logic [TOP_W*2-1:0] exp_l3;
   logic [TOP_W*4-1:0] exp_l2a;
@@ -230,7 +332,20 @@ module t;
   logic [L0A_W-1:0]   exp_l0a_2b;
   logic [7:0]         exp_l0b_2b;
 
+  // Expected array values (l2a branch)
+  logic [L0A_W-1:0]   exp_l0arr0_2a;
+  logic [L0A_W-1:0]   exp_l0arr1_2a;
+  logic [L0A_W-1:0]   exp_l0single_2a;
+  logic [L0A_W-1:0]   exp_l0triple2_2a;
+
+  // Expected array values (l2b branch)
+  logic [L0A_W-1:0]   exp_l0arr0_2b;
+  logic [L0A_W-1:0]   exp_l0arr1_2b;
+  logic [L0A_W-1:0]   exp_l0single_2b;
+  logic [L0A_W-1:0]   exp_l0triple2_2b;
+
   always_ff @(posedge clk) begin
+    // Scalar expected
     exp_l4     <= inst.tb_in ^ TOP_W'('1);
     exp_l3     <= inst.l3.tb_in ^ (TOP_W*2)'('1);
     exp_l2a    <= inst.l3.l2a.tb_in ^ (TOP_W*4)'('1);
@@ -241,12 +356,25 @@ module t;
     exp_l1_2b  <= inst.l3.l2b.l1.tb_in ^ 16'hFFFF;
     exp_l0a_2b <= inst.l3.l2b.l1.l0a.tb_in ^ L0A_W'('1);
     exp_l0b_2b <= inst.l3.l2b.l1.l0b.tb_in ^ 8'hFF;
+
+    // Array expected (l2a branch)
+    exp_l0arr0_2a   <= inst.l3.l2a.l1.l0arr[0].tb_in ^ L0A_W'('1);
+    exp_l0arr1_2a   <= inst.l3.l2a.l1.l0arr[1].tb_in ^ L0A_W'('1);
+    exp_l0single_2a <= inst.l3.l2a.l1.l0single[0].tb_in ^ L0A_W'('1);
+    exp_l0triple2_2a <= inst.l3.l2a.l1.l0triple[2].tb_in ^ L0A_W'('1);
+
+    // Array expected (l2b branch)
+    exp_l0arr0_2b   <= inst.l3.l2b.l1.l0arr[0].tb_in ^ L0A_W'('1);
+    exp_l0arr1_2b   <= inst.l3.l2b.l1.l0arr[1].tb_in ^ L0A_W'('1);
+    exp_l0single_2b <= inst.l3.l2b.l1.l0single[0].tb_in ^ L0A_W'('1);
+    exp_l0triple2_2b <= inst.l3.l2b.l1.l0triple[2].tb_in ^ L0A_W'('1);
   end
 
   always @(posedge clk) begin
     cyc <= cyc + 1;
 
     if (cyc > 3) begin
+      // Scalar checks
       if (l4_dout !== exp_l4) begin
         $display("FAIL cyc=%0d: l4_dout=%h expected %h", cyc, l4_dout, exp_l4);
         $stop;
@@ -285,6 +413,42 @@ module t;
       end
       if (l0b_2b_dout !== exp_l0b_2b) begin
         $display("FAIL cyc=%0d: l0b_2b_dout=%h expected %h", cyc, l0b_2b_dout, exp_l0b_2b);
+        $stop;
+      end
+
+      // Array checks (l2a branch)
+      if (l0arr0_2a_dout !== exp_l0arr0_2a) begin
+        $display("FAIL cyc=%0d: l0arr0_2a_dout=%h expected %h", cyc, l0arr0_2a_dout, exp_l0arr0_2a);
+        $stop;
+      end
+      if (l0arr1_2a_dout !== exp_l0arr1_2a) begin
+        $display("FAIL cyc=%0d: l0arr1_2a_dout=%h expected %h", cyc, l0arr1_2a_dout, exp_l0arr1_2a);
+        $stop;
+      end
+      if (l0single_2a_dout !== exp_l0single_2a) begin
+        $display("FAIL cyc=%0d: l0single_2a_dout=%h expected %h", cyc, l0single_2a_dout, exp_l0single_2a);
+        $stop;
+      end
+      if (l0triple2_2a_dout !== exp_l0triple2_2a) begin
+        $display("FAIL cyc=%0d: l0triple2_2a_dout=%h expected %h", cyc, l0triple2_2a_dout, exp_l0triple2_2a);
+        $stop;
+      end
+
+      // Array checks (l2b branch)
+      if (l0arr0_2b_dout !== exp_l0arr0_2b) begin
+        $display("FAIL cyc=%0d: l0arr0_2b_dout=%h expected %h", cyc, l0arr0_2b_dout, exp_l0arr0_2b);
+        $stop;
+      end
+      if (l0arr1_2b_dout !== exp_l0arr1_2b) begin
+        $display("FAIL cyc=%0d: l0arr1_2b_dout=%h expected %h", cyc, l0arr1_2b_dout, exp_l0arr1_2b);
+        $stop;
+      end
+      if (l0single_2b_dout !== exp_l0single_2b) begin
+        $display("FAIL cyc=%0d: l0single_2b_dout=%h expected %h", cyc, l0single_2b_dout, exp_l0single_2b);
+        $stop;
+      end
+      if (l0triple2_2b_dout !== exp_l0triple2_2b) begin
+        $display("FAIL cyc=%0d: l0triple2_2b_dout=%h expected %h", cyc, l0triple2_2b_dout, exp_l0triple2_2b);
         $stop;
       end
     end
