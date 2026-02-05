@@ -818,10 +818,14 @@ public:
                         }
                     }
                 }
-                // Follow scope alias for nested interface port access
+                // Follow scope alias chain for nested interface port access
                 if (!leftname.empty()) {
-                    const auto aliasIt = m_scopeAliasMap[SAMN_IFTOP].find(lookupSymp);
-                    if (aliasIt != m_scopeAliasMap[SAMN_IFTOP].end()) {
+                    // Follow alias chain until we reach a Cell or no more aliases
+                    int aliasIterations = 0;
+                    while (true) {
+                        const auto aliasIt = m_scopeAliasMap[SAMN_IFTOP].find(lookupSymp);
+                        if (aliasIt == m_scopeAliasMap[SAMN_IFTOP].end()) break;
+                        if (++aliasIterations > 100) break;  // Prevent infinite loop
                         lookupSymp = aliasIt->second;
                         // Alias may point to __Viftop VarScope; find corresponding Cell
                         if (const AstVarScope* const vscp
@@ -836,12 +840,16 @@ public:
                                     VSymEnt* const cellSymp = parentSymp->findIdFlat(cellName);
                                     if (cellSymp && VN_IS(cellSymp->nodep(), Cell)) {
                                         lookupSymp = cellSymp;  // Use Cell for member lookup
+                                        break;
                                     }
                                 }
                             }
                         }
-                    } else {
-                        // No alias; try following IfaceRefDType to interface cell
+                        // If we reached a Cell, stop following aliases
+                        if (VN_IS(lookupSymp->nodep(), Cell)) break;
+                    }
+                    // If still a VarScope (no alias found), try following IfaceRefDType
+                    if (!VN_IS(lookupSymp->nodep(), Cell)) {
                         const AstVar* varp = VN_CAST(lookupSymp->nodep(), Var);
                         if (!varp) {
                             if (const AstVarScope* const vscp

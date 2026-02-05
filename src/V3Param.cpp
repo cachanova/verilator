@@ -72,6 +72,30 @@
 VL_DEFINE_DEBUG_FUNCTIONS;
 
 //######################################################################
+// Static helper to find a variable by name in a module's statements
+
+static const AstVar* findVarByNameInModule(const AstNodeModule* modp, const string& name) {
+    if (!modp) return nullptr;
+    for (AstNode* stmtp = modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+        if (const AstVar* const varp = VN_CAST(stmtp, Var)) {
+            if (varp->name() == name) return varp;
+        }
+    }
+    return nullptr;
+}
+
+// If an unpacked/bracket array, return the subDTypep under it
+static AstNodeDType* arraySubDTypep(AstNodeDType* nodep) {
+    if (const AstUnpackArrayDType* const adtypep = VN_CAST(nodep, UnpackArrayDType)) {
+        return adtypep->subDTypep();
+    }
+    if (const AstBracketArrayDType* const adtypep = VN_CAST(nodep, BracketArrayDType)) {
+        return adtypep->subDTypep();
+    }
+    return nullptr;
+}
+
+//######################################################################
 // Hierarchical block and parameter db (modules without parameters are also handled)
 
 class ParameterizedHierBlocks final {
@@ -1081,17 +1105,7 @@ class ParamProcessor final {
 
     void cellInterfaceCleanup(AstPin* pinsp, AstNodeModule* srcModp, string& longnamer,
                               bool& any_overridesr, IfaceRefRefs& ifaceRefRefs) {
-        auto findVarByNameInModule = [&](const AstNodeModule* modp,
-                                         const string& name) -> const AstVar* {
-            if (!modp) return nullptr;
-            for (AstNode* stmtp = modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
-                if (const AstVar* const varp = VN_CAST(stmtp, Var)) {
-                    if (varp->name() == name) return varp;
-                }
-            }
-            return nullptr;
-        };
-        auto findVarByName = [&](const AstNodeModule* modp, const string& name) -> const AstVar* {
+        auto findVarByName = [](const AstNodeModule* modp, const string& name) -> const AstVar* {
             const AstVar* varp = findVarByNameInModule(modp, name);
             if (varp) return varp;
             const string viftopSuffix = "__Viftop";
@@ -1924,15 +1938,6 @@ class ParamVisitor final : public VNVisitor {
     void visit(AstIfaceRefDType* nodep) override {
         if (nodep->ifacep()) {
             // Port dtypes are relinked via cellInterfaceCleanup; avoid double-parameterization.
-            const auto arraySubDTypep = [](AstNodeDType* dtypep) -> AstNodeDType* {
-                if (const AstUnpackArrayDType* const adtypep = VN_CAST(dtypep, UnpackArrayDType)) {
-                    return adtypep->subDTypep();
-                }
-                if (const AstBracketArrayDType* const adtypep = VN_CAST(dtypep, BracketArrayDType)) {
-                    return adtypep->subDTypep();
-                }
-                return nullptr;
-            };
             if (m_ifacePortDTypes.find(nodep) != m_ifacePortDTypes.end()) return;
             if (m_modp) {
                 for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
@@ -1971,15 +1976,6 @@ class ParamVisitor final : public VNVisitor {
         // Build cache of interface port names as we encounter them
         if (isIfacePortVar(nodep)) { m_ifacePortNames.insert(nodep->name()); }
         if (isIfacePortVar(nodep)) {
-            const auto arraySubDTypep = [](AstNodeDType* dtypep) -> AstNodeDType* {
-                if (const AstUnpackArrayDType* const adtypep = VN_CAST(dtypep, UnpackArrayDType)) {
-                    return adtypep->subDTypep();
-                }
-                if (const AstBracketArrayDType* const adtypep = VN_CAST(dtypep, BracketArrayDType)) {
-                    return adtypep->subDTypep();
-                }
-                return nullptr;
-            };
             if (AstIfaceRefDType* const ifrefp = VN_CAST(nodep->subDTypep(), IfaceRefDType)) {
                 m_ifacePortDTypes.insert(ifrefp);
             } else if (AstNodeDType* const subp = arraySubDTypep(nodep->subDTypep())) {
@@ -2143,28 +2139,7 @@ class ParamVisitor final : public VNVisitor {
             // Simply skip the replacement - the cell array ref will be resolved later.
             if (pos == string::npos) {
                 if (m_modp) {
-                    const auto arraySubDTypep = [](AstNodeDType* dtypep) -> AstNodeDType* {
-                        if (const AstUnpackArrayDType* const adtypep
-                            = VN_CAST(dtypep, UnpackArrayDType)) {
-                            return adtypep->subDTypep();
-                        }
-                        if (const AstBracketArrayDType* const adtypep
-                            = VN_CAST(dtypep, BracketArrayDType)) {
-                            return adtypep->subDTypep();
-                        }
-                        return nullptr;
-                    };
                     const string elementName = baseName + "__BRA__" + index + "__KET__";
-                    auto findVarByNameInModule = [&](const AstNodeModule* modp,
-                                                     const string& name) -> const AstVar* {
-                        if (!modp) return nullptr;
-                        for (AstNode* stmtp = modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
-                            if (const AstVar* const varp = VN_CAST(stmtp, Var)) {
-                                if (varp->name() == name) return varp;
-                            }
-                        }
-                        return nullptr;
-                    };
                     for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
                         const AstVar* const portVarp = VN_CAST(stmtp, Var);
                         if (!isIfacePortVar(portVarp)) continue;
