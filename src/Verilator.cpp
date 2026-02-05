@@ -173,6 +173,10 @@ static void process() {
 
         if (v3Global.opt.stats()) V3Stats::statsStageAll(v3Global.rootp(), "Link");
 
+        // Pre-unroll loops that access interface arrays before parameter resolution
+        // This ensures loop indices become constants before V3Param tries to resolve them
+        V3Inst::preUnrollIfaceLoops(v3Global.rootp());
+
         // Remove parameters by cloning modules to de-parameterized versions
         //   This requires some width calculations and constant propagation
         // No more AstGenCase/AstGenFor/AstGenIf after this

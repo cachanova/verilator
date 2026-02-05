@@ -26,8 +26,457 @@
 #include "V3Inst.h"
 
 #include "V3Const.h"
+#include "V3Global.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
+
+//######################################################################
+// Detect if loop body contains interface array accesses indexed by loop variable
+
+class LoopInterfaceDetector final : public VNVisitorConst {
+    bool m_hasNonConstIfaceAccess = false;
+    AstVar* m_loopVarp = nullptr;
+
+    // Check if an expression references the loop variable
+    bool referencesLoopVar(AstNode* nodep) {
+        bool found = false;
+        nodep->foreach([&](const AstVarRef* refp) {
+            if (refp->varp() == m_loopVarp) found = true;
+        });
+        return found;
+    }
+
+    void visit(AstCellArrayRef* nodep) override {
+        UINFO(4, "    LoopInterfaceDetector: checking CellArrayRef " << nodep->name() << endl);
+        // CellArrayRef is an interface array reference at this early stage
+        // Check if the select expression references the loop variable
+        if (nodep->selp()) {
+            if (referencesLoopVar(nodep->selp())) {
+                UINFO(4, "      CellArrayRef index references loop var!" << endl);
+                m_hasNonConstIfaceAccess = true;
+            }
+        }
+        iterateChildrenConst(nodep);
+    }
+
+    void visit(AstArraySel* nodep) override {
+        // Check if this is an interface array access
+        if (nodep->fromp() && nodep->fromp()->dtypep()) {
+            AstNodeDType* const dtp = nodep->fromp()->dtypep()->skipRefp();
+            if (const AstUnpackArrayDType* const arrp = VN_CAST(dtp, UnpackArrayDType)) {
+                AstNodeDType* const subDtp = arrp->subDTypep() ? arrp->subDTypep()->skipRefp() : nullptr;
+                if (VN_IS(subDtp, IfaceRefDType)) {
+                    if (!VN_AS(subDtp, IfaceRefDType)->isVirtual()) {
+                        // Check if the index references the loop variable
+                        if (referencesLoopVar(nodep->bitp())) {
+                            m_hasNonConstIfaceAccess = true;
+                        }
+                    }
+                }
+            }
+        }
+        iterateChildrenConst(nodep);
+    }
+
+    void visit(AstNode* nodep) override { iterateChildrenConst(nodep); }
+
+public:
+    // Detect if the loop body contains non-constant interface array accesses
+    // that reference the given loop variable
+    static bool detect(AstNode* bodyp, AstVar* loopVarp) {
+        UINFO(4, "      LoopInterfaceDetector::detect for loopVar=" << loopVarp->name() << endl);
+        // Debug: print all node types in the body (iterate all siblings and their children)
+        if (debug() >= 5) {
+            for (AstNode* stmtp = bodyp; stmtp; stmtp = stmtp->nextp()) {
+                stmtp->foreach([](AstNode* nodep) {
+                    UINFO(5, "        Node: " << nodep->typeName() << " " << nodep << endl);
+                });
+            }
+        }
+        LoopInterfaceDetector detector;
+        detector.m_loopVarp = loopVarp;
+        // Iterate all statements in the loop body (not just the first one)
+        for (AstNode* stmtp = bodyp; stmtp; stmtp = stmtp->nextp()) {
+            detector.iterateConst(stmtp);
+        }
+        UINFO(4, "      LoopInterfaceDetector::detect result=" << detector.m_hasNonConstIfaceAccess << endl);
+        return detector.m_hasNonConstIfaceAccess;
+    }
+};
+
+//######################################################################
+// Pre-unroll loops with interface array accesses before V3Param runs
+
+class InstPreUnrollVisitor final : public VNVisitor {
+    // METHODS
+    // Extract loop variable from a for loop pattern
+    // Looking for: init; condition; increment pattern
+    // Returns nullptr if loop is not a simple unrollable for loop
+    AstVar* findLoopVar(AstLoop* loopp) {
+        // Look at the body for the loop test to find the condition
+        // The loop variable should be the first variable on the LHS of a comparison
+        for (AstNode* stmtp = loopp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+            if (AstLoopTest* const testp = VN_CAST(stmtp, LoopTest)) {
+                // Look for comparison operators (Lt, Lte, Gt, Gte)
+                // The loop variable is typically on the left side
+                if (AstLt* const ltp = VN_CAST(testp->condp(), Lt)) {
+                    if (AstVarRef* const refp = VN_CAST(ltp->lhsp(), VarRef)) {
+                        UINFO(4, "      findLoopVar: found loopVar " << refp->varp()->name() << endl);
+                        return refp->varp();
+                    }
+                } else if (AstLte* const ltep = VN_CAST(testp->condp(), Lte)) {
+                    if (AstVarRef* const refp = VN_CAST(ltep->lhsp(), VarRef)) {
+                        UINFO(4, "      findLoopVar: found loopVar " << refp->varp()->name() << endl);
+                        return refp->varp();
+                    }
+                } else if (AstGt* const gtp = VN_CAST(testp->condp(), Gt)) {
+                    if (AstVarRef* const refp = VN_CAST(gtp->lhsp(), VarRef)) {
+                        UINFO(4, "      findLoopVar: found loopVar " << refp->varp()->name() << endl);
+                        return refp->varp();
+                    }
+                } else if (AstGte* const gtep = VN_CAST(testp->condp(), Gte)) {
+                    if (AstVarRef* const refp = VN_CAST(gtep->lhsp(), VarRef)) {
+                        UINFO(4, "      findLoopVar: found loopVar " << refp->varp()->name() << endl);
+                        return refp->varp();
+                    }
+                }
+            }
+        }
+        UINFO(4, "      findLoopVar: no loop var found" << endl);
+        return nullptr;
+    }
+
+    // Find preceding initialization assignment for the loop variable
+    AstAssign* findInitAssign(AstLoop* loopp, AstVar* loopVarp) {
+        // Look backwards from the loop for an assignment to the loop var
+        for (AstNode* nodep = loopp->backp(); nodep; nodep = nodep->backp()) {
+            if (AstAssign* const assignp = VN_CAST(nodep, Assign)) {
+                if (AstVarRef* const lhsp = VN_CAST(assignp->lhsp(), VarRef)) {
+                    if (lhsp->varp() == loopVarp) return assignp;
+                }
+            }
+            // Stop if we hit a statement that's not an assignment
+            if (!VN_IS(nodep, Assign) && !VN_IS(nodep, AssignDly)) break;
+        }
+        return nullptr;
+    }
+
+    // Try to evaluate a parameter's value to a constant int
+    // Returns true if successful and stores result in outVal
+    bool evalParamValue(AstVar* varp, int& outVal) {
+        if (!varp->valuep()) return false;
+        AstNode* valuep = varp->valuep();
+
+        // Direct constant
+        if (AstConst* const constp = VN_CAST(valuep, Const)) {
+            outVal = constp->toSInt();
+            return true;
+        }
+
+        // Otherwise, clone and try to constify
+        AstNode* clonep = valuep->cloneTree(false);
+        AstConst* constp = VN_CAST(V3Const::constifyEdit(clonep), Const);
+        if (constp) {
+            outVal = constp->toSInt();
+            VL_DO_DANGLING(constp->deleteTree(), constp);
+            return true;
+        }
+        if (clonep) VL_DO_DANGLING(clonep->deleteTree(), clonep);
+        return false;
+    }
+
+    // Try to evaluate an expression to a constant, substituting parameter values
+    // Returns true if successful and stores result in outVal
+    bool evalExprWithParams(AstNode* exprp, int& outVal) {
+        // Direct constant
+        if (AstConst* const constp = VN_CAST(exprp, Const)) {
+            outVal = constp->toSInt();
+            return true;
+        }
+
+        // Parameter reference
+        if (AstVarRef* const refp = VN_CAST(exprp, VarRef)) {
+            if (refp->varp()->isParam()) {
+                return evalParamValue(refp->varp(), outVal);
+            }
+        }
+
+        // Handle binary operations recursively (N-1, N+1, N*2, etc.)
+        if (AstSub* const subp = VN_CAST(exprp, Sub)) {
+            int lhsVal, rhsVal;
+            if (evalExprWithParams(subp->lhsp(), lhsVal)
+                && evalExprWithParams(subp->rhsp(), rhsVal)) {
+                outVal = lhsVal - rhsVal;
+                return true;
+            }
+        } else if (AstAdd* const addp = VN_CAST(exprp, Add)) {
+            int lhsVal, rhsVal;
+            if (evalExprWithParams(addp->lhsp(), lhsVal)
+                && evalExprWithParams(addp->rhsp(), rhsVal)) {
+                outVal = lhsVal + rhsVal;
+                return true;
+            }
+        } else if (AstMul* const mulp = VN_CAST(exprp, Mul)) {
+            int lhsVal, rhsVal;
+            if (evalExprWithParams(mulp->lhsp(), lhsVal)
+                && evalExprWithParams(mulp->rhsp(), rhsVal)) {
+                outVal = lhsVal * rhsVal;
+                return true;
+            }
+        }
+
+        // Fallback: clone and try V3Const::constifyEdit
+        AstNode* clonep = exprp->cloneTree(false);
+        AstConst* constp = VN_CAST(V3Const::constifyEdit(clonep), Const);
+        if (constp) {
+            outVal = constp->toSInt();
+            VL_DO_DANGLING(constp->deleteTree(), constp);
+            return true;
+        }
+        // clonep may have been edited/deleted by constifyEdit
+        return false;
+    }
+
+    // Find the loop condition from the LoopTest
+    bool findLoopBounds(AstLoop* loopp, AstVar* loopVarp, AstAssign* initp,
+                        int& startVal, int& endVal, int& stepVal, bool& ascending) {
+        // Get start value from init
+        if (!evalExprWithParams(initp->rhsp(), startVal)) return false;
+
+        // Find the loop test and extract bounds
+        for (AstNode* stmtp = loopp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+            if (AstLoopTest* const testp = VN_CAST(stmtp, LoopTest)) {
+                // Handle conditions like: i < N, i <= N, i > N, i >= N
+                if (AstLt* const ltp = VN_CAST(testp->condp(), Lt)) {
+                    // i < N
+                    if (AstVarRef* const refp = VN_CAST(ltp->lhsp(), VarRef)) {
+                        if (refp->varp() == loopVarp) {
+                            if (!evalExprWithParams(ltp->rhsp(), endVal)) return false;
+                            ascending = true;
+                            stepVal = 1;  // Default
+                            return true;
+                        }
+                    }
+                } else if (AstLte* const ltep = VN_CAST(testp->condp(), Lte)) {
+                    // i <= N
+                    if (AstVarRef* const refp = VN_CAST(ltep->lhsp(), VarRef)) {
+                        if (refp->varp() == loopVarp) {
+                            if (!evalExprWithParams(ltep->rhsp(), endVal)) return false;
+                            endVal = endVal + 1;  // i <= N means iterate until N+1
+                            ascending = true;
+                            stepVal = 1;
+                            return true;
+                        }
+                    }
+                } else if (AstGt* const gtp = VN_CAST(testp->condp(), Gt)) {
+                    // i > N (descending)
+                    if (AstVarRef* const refp = VN_CAST(gtp->lhsp(), VarRef)) {
+                        if (refp->varp() == loopVarp) {
+                            if (!evalExprWithParams(gtp->rhsp(), endVal)) return false;
+                            ascending = false;
+                            stepVal = -1;
+                            return true;
+                        }
+                    }
+                } else if (AstGte* const gtep = VN_CAST(testp->condp(), Gte)) {
+                    // i >= N (descending)
+                    if (AstVarRef* const refp = VN_CAST(gtep->lhsp(), VarRef)) {
+                        if (refp->varp() == loopVarp) {
+                            if (!evalExprWithParams(gtep->rhsp(), endVal)) return false;
+                            endVal = endVal - 1;  // i >= N means stop before N-1
+                            ascending = false;
+                            stepVal = -1;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Substitute loop variable with constant value in the given tree
+    void substituteLoopVar(AstNode* nodep, AstVar* loopVarp, int value) {
+        std::vector<AstVarRef*> toReplace;
+        nodep->foreach([&](AstVarRef* refp) {
+            if (refp->varp() == loopVarp && refp->access().isReadOnly()) {
+                toReplace.push_back(refp);
+            }
+        });
+        for (AstVarRef* const refp : toReplace) {
+            // Create a constant with signed 32-bit integer type (matching 'int')
+            AstConst* const constp = new AstConst{refp->fileline(), AstConst::Signed32{}, value};
+            // Set proper dtype - loop variables are 'int' which is signed 32-bit
+            constp->dtypeSetSigned32();
+            refp->replaceWith(constp);
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+        }
+    }
+
+    // Check if this loop contains nested loops (we don't pre-unroll those)
+    bool containsNestedLoop(AstLoop* loopp) {
+        bool found = false;
+        loopp->stmtsp()->foreachAndNext([&](AstLoop* nestedp) {
+            if (nestedp != loopp) found = true;
+        });
+        return found;
+    }
+
+    // Check if this loop should be pre-unrolled
+    bool shouldPreUnroll(AstLoop* loopp) {
+        UINFO(4, "    shouldPreUnroll checking loop " << loopp << endl);
+
+        // Skip nested loops for now to avoid duplicate block name issues
+        if (containsNestedLoop(loopp)) {
+            UINFO(4, "      shouldPreUnroll: contains nested loop, skipping" << endl);
+            return false;
+        }
+
+        // Find the loop variable
+        AstVar* const loopVarp = findLoopVar(loopp);
+        if (!loopVarp) {
+            UINFO(4, "      shouldPreUnroll: no loop var found" << endl);
+            return false;
+        }
+        UINFO(4, "      shouldPreUnroll: loop var = " << loopVarp->name() << endl);
+
+        // Check if the loop body contains interface array accesses with the loop var
+        if (!LoopInterfaceDetector::detect(loopp->stmtsp(), loopVarp)) {
+            UINFO(4, "      shouldPreUnroll: no interface array access detected" << endl);
+            return false;
+        }
+        UINFO(4, "      shouldPreUnroll: interface array access detected!" << endl);
+
+        // Find the initialization
+        AstAssign* const initp = findInitAssign(loopp, loopVarp);
+        if (!initp) {
+            UINFO(4, "      shouldPreUnroll: no init assign found" << endl);
+            return false;
+        }
+        UINFO(4, "      shouldPreUnroll: init assign found" << endl);
+
+        // Try to determine bounds
+        int startVal, endVal, stepVal;
+        bool ascending;
+        if (!findLoopBounds(loopp, loopVarp, initp, startVal, endVal, stepVal, ascending)) {
+            UINFO(4, "      shouldPreUnroll: cannot determine bounds" << endl);
+            return false;
+        }
+        UINFO(4, "      shouldPreUnroll: bounds = " << startVal << ".." << endVal << endl);
+
+        // Check iteration count is reasonable
+        int iterCount = ascending ? (endVal - startVal) : (startVal - endVal);
+        if (iterCount < 0) iterCount = -iterCount;
+        if (iterCount > static_cast<int>(v3Global.opt.unrollCount())) {
+            UINFO(4, "      shouldPreUnroll: too many iterations" << endl);
+            return false;
+        }
+
+        UINFO(4, "      shouldPreUnroll: YES, will pre-unroll!" << endl);
+        return true;
+    }
+
+    // Attempt to pre-unroll the loop
+    void attemptPreUnroll(AstLoop* loopp) {
+        AstVar* const loopVarp = findLoopVar(loopp);
+        if (!loopVarp) return;
+
+        AstAssign* const initp = findInitAssign(loopp, loopVarp);
+        if (!initp) return;
+
+        int startVal, endVal, stepVal;
+        bool ascending;
+        if (!findLoopBounds(loopp, loopVarp, initp, startVal, endVal, stepVal, ascending)) {
+            return;
+        }
+
+        UINFO(4, "  Pre-unrolling interface loop " << loopp << " var=" << loopVarp->name()
+              << " range=" << startVal << ".." << endVal << endl);
+
+        // Helper to check if a statement is the loop increment (assigns to loop var)
+        auto isLoopIncrement = [loopVarp](AstNode* stmtp) {
+            if (AstAssign* const assignp = VN_CAST(stmtp, Assign)) {
+                if (AstVarRef* const lhsp = VN_CAST(assignp->lhsp(), VarRef)) {
+                    if (lhsp->varp() == loopVarp) return true;
+                }
+            }
+            return false;
+        };
+
+        // Create unrolled statements
+        AstNode* newStmtsp = nullptr;
+        if (ascending) {
+            for (int i = startVal; i < endVal; i += stepVal) {
+                // Clone the loop body (skip LoopTest and increment)
+                for (AstNode* stmtp = loopp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                    if (VN_IS(stmtp, LoopTest)) continue;
+                    if (isLoopIncrement(stmtp)) continue;
+                    AstNode* const clonep = stmtp->cloneTree(false);
+                    substituteLoopVar(clonep, loopVarp, i);
+                    // Note: Don't call V3Const::constifyEdit here - the later
+                    // V3Param and V3Width passes will handle constant folding
+                    // after dtypes are properly resolved
+                    newStmtsp = AstNode::addNext(newStmtsp, clonep);
+                }
+            }
+        } else {
+            for (int i = startVal; i > endVal; i += stepVal) {
+                for (AstNode* stmtp = loopp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                    if (VN_IS(stmtp, LoopTest)) continue;
+                    if (isLoopIncrement(stmtp)) continue;
+                    AstNode* const clonep = stmtp->cloneTree(false);
+                    substituteLoopVar(clonep, loopVarp, i);
+                    // Note: Don't call V3Const::constifyEdit here - the later
+                    // V3Param and V3Width passes will handle constant folding
+                    // after dtypes are properly resolved
+                    newStmtsp = AstNode::addNext(newStmtsp, clonep);
+                }
+            }
+        }
+
+        // Replace loop with unrolled statements
+        if (newStmtsp) {
+            loopp->replaceWith(newStmtsp);
+        } else {
+            loopp->unlinkFrBack();
+        }
+
+        // Also remove the initialization assignment
+        initp->unlinkFrBack();
+        VL_DO_DANGLING(pushDeletep(initp), initp);
+        VL_DO_DANGLING(pushDeletep(loopp), loopp);
+    }
+
+    // VISITORS
+    void visit(AstLoop* nodep) override {
+        UINFO(4, "  InstPreUnroll: visiting AstLoop " << nodep << endl);
+        // First handle nested loops (bottom-up)
+        iterateChildren(nodep);
+        // Then check if this loop should be pre-unrolled
+        if (shouldPreUnroll(nodep)) {
+            attemptPreUnroll(nodep);
+        }
+    }
+
+    void visit(AstNodeModule* nodep) override {
+        UINFO(4, "  InstPreUnroll: visiting module " << nodep->name() << endl);
+        iterateChildren(nodep);
+    }
+    void visit(AstAlways* nodep) override {
+        UINFO(4, "  InstPreUnroll: visiting always " << nodep << endl);
+        iterateChildren(nodep);
+    }
+    void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+public:
+    // CONSTRUCTORS
+    explicit InstPreUnrollVisitor(AstNetlist* nodep) {
+        UINFO(4, "  InstPreUnroll: starting visitor" << endl);
+        iterate(nodep);
+        UINFO(4, "  InstPreUnroll: finished visitor" << endl);
+    }
+    ~InstPreUnrollVisitor() override = default;
+};
 
 //######################################################################
 // Inst state, as a visitor of each AstNode
@@ -722,4 +1171,11 @@ void V3Inst::dearrayAll(AstNetlist* nodep) {
     UINFO(2, __FUNCTION__ << ":");
     { InstDeVisitor{nodep}; }  // Destruct before checking
     V3Global::dumpCheckGlobalTree("dearray", 0, dumpTreeEitherLevel() >= 6);
+}
+
+void V3Inst::preUnrollIfaceLoops(AstNetlist* nodep) {
+    UINFO(2, __FUNCTION__ << ": starting pre-unroll of interface loops" << endl);
+    { InstPreUnrollVisitor{nodep}; }  // Pre-unroll loops with interface array access
+    UINFO(2, __FUNCTION__ << ": finished pre-unroll of interface loops" << endl);
+    V3Global::dumpCheckGlobalTree("preunroll_iface", 0, dumpTreeEitherLevel() >= 6);
 }
