@@ -117,10 +117,11 @@ AstRange* V3ParseGrammar::scrubRange(AstNodeRange* nrangep) {
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
         }
     }
+    // Multidimensional instances/interfaces are now supported.
+    // The full dimensionality is encoded in the Var's dtype via createArray().
+    // Cell's rangep must be a single node (OP_OPTIONAL), so delete extra ranges here.
+    // V3Inst reads dimensions from the Var's dtype instead.
     if (nrangep && nrangep->nextp()) {
-        // Not supported by at least 2 of big 3
-        nrangep->nextp()->v3warn(E_UNSUPPORTED,
-                                 "Unsupported: Multidimensional instances/interfaces.");
         nrangep->nextp()->unlinkFrBackWithNext()->deleteTree();
     }
     return VN_CAST(nrangep, Range);

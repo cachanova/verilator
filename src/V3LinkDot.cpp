@@ -510,14 +510,18 @@ public:
     void insertIfaceVarSym(VSymEnt* symp) {  // Where sym is for a VAR of dtype IFACEREFDTYPE
         m_ifaceVarSyms.push_back(symp);
     }
-    // Iface for a raw or arrayed iface
+    // Iface for a raw or arrayed iface (supports multi-dimensional arrays)
     static AstIfaceRefDType* ifaceRefFromArray(AstNodeDType* nodep) {
         AstIfaceRefDType* ifacerefp = VN_CAST(nodep, IfaceRefDType);
-        if (!ifacerefp) {
+        while (!ifacerefp) {
             if (const AstBracketArrayDType* const arrp = VN_CAST(nodep, BracketArrayDType)) {
-                ifacerefp = VN_CAST(arrp->subDTypep(), IfaceRefDType);
+                nodep = arrp->subDTypep();
+                ifacerefp = VN_CAST(nodep, IfaceRefDType);
             } else if (const AstUnpackArrayDType* const arrp = VN_CAST(nodep, UnpackArrayDType)) {
-                ifacerefp = VN_CAST(arrp->subDTypep(), IfaceRefDType);
+                nodep = arrp->subDTypep();
+                ifacerefp = VN_CAST(nodep, IfaceRefDType);
+            } else {
+                break;
             }
         }
         return ifacerefp;
@@ -917,10 +921,12 @@ public:
                      << ((lookupSymp->symPrefix() == "") ? "" : lookupSymp->symPrefix() + dotname)
                      << "  at se" << lookupSymp << " fallback=" << fallback);
         VSymEnt* foundp = findWithPrefix(dotname);
-        const size_t braPos = dotname.rfind("__BRA__");
-        const size_t ketPos = dotname.rfind("__KET__");
+        // Use find() to get the first __BRA__ position (for base name extraction)
+        const size_t firstBraPos = dotname.find("__BRA__");
+        const size_t lastKetPos = dotname.rfind("__KET__");
         const bool hasArraySuffix
-            = (braPos != string::npos && ketPos != string::npos && ketPos > braPos);
+            = (firstBraPos != string::npos && lastKetPos != string::npos
+               && lastKetPos > firstBraPos);
         if (foundp && hasArraySuffix) {
             if (!VN_IS(foundp->nodep(), Var) && !VN_IS(foundp->nodep(), ModportVarRef)
                 && !VN_IS(foundp->nodep(), VarScope)) {
@@ -929,8 +935,9 @@ public:
         }
         if (!foundp) {
             if (hasArraySuffix) {
-                const string baseName = dotname.substr(0, braPos);
-                const string suffix = dotname.substr(braPos);
+                // Use firstBraPos to get the true base name (before any array indices)
+                const string baseName = dotname.substr(0, firstBraPos);
+                const string suffix = dotname.substr(firstBraPos);
                 const string viftopArray = baseName + "__Viftop" + suffix;
                 const string baseViftop = baseName + "__Viftop";
                 auto isIfaceArray = [](VSymEnt* symp) -> bool {
@@ -5016,10 +5023,29 @@ class LinkDotResolveVisitor final : public VNVisitor {
         symIterateNull(nodep->attrp(), m_curSymp);
         if (m_ds.m_unresolvedCell && (m_ds.m_dotPos == DP_SCOPE || m_ds.m_dotPos == DP_FIRST)) {
             AstNodeExpr* const exprp = nodep->bitp()->unlinkFrBack();
-            AstCellArrayRef* const newp
-                = new AstCellArrayRef{nodep->fileline(), nodep->fromp()->name(), exprp};
-            nodep->replaceWith(newp);
-            VL_DO_DANGLING(pushDeletep(nodep), nodep);
+            // For nested SelBit (2-D+ arrays), fromp may already be a CellArrayRef
+            // from processing an inner dimension. Add this index to that CellArrayRef's selp list.
+            AstCellArrayRef* innerCellArrayRefp = VN_CAST(nodep->fromp(), CellArrayRef);
+            UINFO(4, "SelBit CellArrayRef check: fromp type="
+                         << nodep->fromp()->typeName()
+                         << " innerCellArrayRefp=" << (innerCellArrayRefp ? "yes" : "no") << endl);
+            if (innerCellArrayRefp) {
+                // Multi-dimensional array: add this dimension's index to the existing CellArrayRef
+                // The selp list order matches the __BRA__??__KET__ order in dotText
+                innerCellArrayRefp->addSelp(exprp);
+                innerCellArrayRefp->unlinkFrBack();
+                nodep->replaceWith(innerCellArrayRefp);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                UINFO(4, "  Added index to existing CellArrayRef, selp count now = "
+                             << (innerCellArrayRefp->selp() ? "1+" : "0") << endl);
+            } else {
+                // First dimension: create new CellArrayRef
+                const string baseName = nodep->fromp()->name();
+                AstCellArrayRef* const newp
+                    = new AstCellArrayRef{nodep->fileline(), baseName, exprp};
+                nodep->replaceWith(newp);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
+            }
         }
     }
     void visit(AstNodePreSel* nodep) override {

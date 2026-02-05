@@ -84,13 +84,39 @@ static const AstVar* findVarByNameInModule(const AstNodeModule* modp, const stri
     return nullptr;
 }
 
-// If an unpacked/bracket array, return the subDTypep under it
+// If an unpacked/bracket array, return the innermost subDTypep under it
+// (unwraps nested arrays for multi-dimensional support)
 static AstNodeDType* arraySubDTypep(AstNodeDType* nodep) {
-    if (const AstUnpackArrayDType* const adtypep = VN_CAST(nodep, UnpackArrayDType)) {
-        return adtypep->subDTypep();
+    AstNodeDType* subp = nullptr;
+    while (nodep) {
+        if (const AstUnpackArrayDType* const adtypep = VN_CAST(nodep, UnpackArrayDType)) {
+            subp = adtypep->subDTypep();
+            nodep = subp;
+        } else if (const AstBracketArrayDType* const adtypep = VN_CAST(nodep, BracketArrayDType)) {
+            subp = adtypep->subDTypep();
+            nodep = subp;
+        } else {
+            break;
+        }
     }
-    if (const AstBracketArrayDType* const adtypep = VN_CAST(nodep, BracketArrayDType)) {
-        return adtypep->subDTypep();
+    return subp;
+}
+
+// Drill through nested selection nodes (SelBit, ArraySel) to find the innermost VarRef
+// Returns nullptr if the innermost node is not a VarRef
+// Note: At V3Param stage, selections are still AstSelBit; later they become AstArraySel
+static AstVarRef* getInnermostVarRef(AstNode* nodep) {
+    while (nodep) {
+        if (AstVarRef* const varrefp = VN_CAST(nodep, VarRef)) {
+            return varrefp;
+        }
+        if (AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
+            nodep = selp->fromp();
+        } else if (AstSelBit* const selp = VN_CAST(nodep, SelBit)) {
+            nodep = selp->fromp();
+        } else {
+            break;
+        }
     }
     return nullptr;
 }
@@ -1133,16 +1159,17 @@ class ParamProcessor final {
                 } else if (varp && varp->subDTypep() && arraySubDTypep(varp->subDTypep())
                            && VN_CAST(arraySubDTypep(varp->subDTypep()), IfaceRefDType)) {
                     pinIrefp = VN_CAST(arraySubDTypep(varp->subDTypep()), IfaceRefDType);
-                } else if (exprp && exprp->op1p() && VN_IS(exprp->op1p(), VarRef)
-                           && VN_CAST(exprp->op1p(), VarRef)->varp()
-                           && VN_CAST(exprp->op1p(), VarRef)->varp()->subDTypep()
-                           && arraySubDTypep(VN_CAST(exprp->op1p(), VarRef)->varp()->subDTypep())
-                           && VN_CAST(
-                               arraySubDTypep(VN_CAST(exprp->op1p(), VarRef)->varp()->subDTypep()),
-                               IfaceRefDType)) {
-                    pinIrefp
-                        = VN_AS(arraySubDTypep(VN_AS(exprp->op1p(), VarRef)->varp()->subDTypep()),
-                                IfaceRefDType);
+                } else if (AstVarRef* const innerVarRefp
+                           = exprp ? getInnermostVarRef(const_cast<AstNode*>(exprp)) : nullptr) {
+                    // Handle ArraySel (including nested for multi-dimensional arrays)
+                    // Drill through to find the base VarRef
+                    if (innerVarRefp->varp() && innerVarRefp->varp()->subDTypep()
+                        && arraySubDTypep(innerVarRefp->varp()->subDTypep())
+                        && VN_CAST(arraySubDTypep(innerVarRefp->varp()->subDTypep()),
+                                   IfaceRefDType)) {
+                        pinIrefp = VN_AS(arraySubDTypep(innerVarRefp->varp()->subDTypep()),
+                                         IfaceRefDType);
+                    }
                 } else if (VN_IS(exprp, CellArrayRef)) {
                     // Interface array element selection (e.g., l1(l2.l1[0]) for nested iface array)
                     // Try to map the CellArrayRef to the parent interface array var.
@@ -2121,63 +2148,94 @@ class ParamVisitor final : public VNVisitor {
         VL_DO_DANGLING(pushDeletep(nodep), nodep);
     }
     void visit(AstCellArrayRef* nodep) override {
-        V3Const::constifyParamsEdit(nodep->selp());
-        if (const AstConst* const constp = VN_CAST(nodep->selp(), Const)) {
-            const string index = AstNode::encodeNumber(constp->toSInt());
-            // For nested interface array ports, the node name may have a __Viftop suffix
-            // that doesn't exist in the original unlinked text. Try without the suffix.
-            const string viftopSuffix = "__Viftop";
-            const string baseName
-                = VString::endsWith(nodep->name(), viftopSuffix)
-                      ? nodep->name().substr(0, nodep->name().size() - viftopSuffix.size())
-                      : nodep->name();
-            const string replacestr = baseName + "__BRA__??__KET__";
-            const size_t pos = m_unlinkedTxt.find(replacestr);
-            // For interface port array element selections (e.g., l1(l2.l1[0])),
-            // the AstCellArrayRef may be visited outside of an AstUnlinkedRef context.
-            // In such cases, m_unlinkedTxt won't contain the expected pattern.
-            // Simply skip the replacement - the cell array ref will be resolved later.
-            if (pos == string::npos) {
-                if (m_modp) {
-                    const string elementName = baseName + "__BRA__" + index + "__KET__";
-                    for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
-                        const AstVar* const portVarp = VN_CAST(stmtp, Var);
-                        if (!isIfacePortVar(portVarp)) continue;
-                        AstIfaceRefDType* portIrefp
-                            = VN_CAST(portVarp->subDTypep(), IfaceRefDType);
-                        if (!portIrefp && arraySubDTypep(portVarp->subDTypep())) {
-                            portIrefp = VN_CAST(arraySubDTypep(portVarp->subDTypep()),
-                                                IfaceRefDType);
+        // For multi-dimensional arrays, selp is a list of indices (one per dimension).
+        // Iterate through all and replace each __BRA__??__KET__ placeholder in order.
+        const string viftopSuffix = "__Viftop";
+        const string baseName
+            = VString::endsWith(nodep->name(), viftopSuffix)
+                  ? nodep->name().substr(0, nodep->name().size() - viftopSuffix.size())
+                  : nodep->name();
+        const string placeholder = "__BRA__??__KET__";
+
+        // Constify all selp nodes first
+        for (AstNode* selNodep = nodep->selp(); selNodep; selNodep = selNodep->nextp()) {
+            V3Const::constifyParamsEdit(selNodep);
+        }
+
+        // Build the full element name by replacing all placeholders
+        string elementIndices;  // Accumulates "__BRA__<idx>__KET__" for each dimension
+        for (AstNode* selNodep = nodep->selp(); selNodep; selNodep = selNodep->nextp()) {
+            if (const AstConst* const constp = VN_CAST(selNodep, Const)) {
+                const string index = AstNode::encodeNumber(constp->toSInt());
+                elementIndices += "__BRA__" + index + "__KET__";
+
+                // Also replace in m_unlinkedTxt if we're in an UnlinkedRef context
+                if (!m_unlinkedTxt.empty()) {
+                    // Try to find the placeholder pattern
+                    const string replacestr = baseName + placeholder;
+                    size_t pos = m_unlinkedTxt.find(replacestr);
+                    // If not found with baseName prefix, find just the placeholder
+                    if (pos == string::npos) {
+                        const size_t basePos = m_unlinkedTxt.find(baseName);
+                        if (basePos != string::npos) {
+                            pos = m_unlinkedTxt.find(placeholder, basePos);
                         }
-                        if (!portIrefp) continue;
-                        const AstNodeModule* ifaceModp = portIrefp->ifaceViaCellp();
-                        if (!ifaceModp) ifaceModp = portIrefp->ifacep();
-                        if (!ifaceModp) continue;
-                        const AstVar* matchp = findVarByNameInModule(ifaceModp, nodep->name());
-                        if (!matchp) {
-                            matchp = findVarByNameInModule(ifaceModp, baseName);
-                            if (!matchp) {
-                                matchp = findVarByNameInModule(ifaceModp, baseName + viftopSuffix);
-                            }
+                    }
+                    if (pos != string::npos) {
+                        const bool isDirectMatch
+                            = (m_unlinkedTxt.compare(pos, replacestr.length(), replacestr) == 0);
+                        if (isDirectMatch) {
+                            m_unlinkedTxt.replace(pos, replacestr.length(),
+                                                  baseName + "__BRA__" + index + "__KET__");
+                        } else {
+                            m_unlinkedTxt.replace(pos, placeholder.length(),
+                                                  "__BRA__" + index + "__KET__");
                         }
-                        if (!matchp) continue;
-                        AstVarXRef* const newp
-                            = new AstVarXRef{nodep->fileline(), elementName,
-                                             portVarp->name(), VAccess::READ};
-                        nodep->replaceWith(newp);
-                        VL_DO_DANGLING(pushDeletep(nodep), nodep);
-                        return;
                     }
                 }
-                UINFO(9, "Skipping unlinked text replacement for " << nodep << endl);
+            } else {
+                nodep->v3error("Could not expand constant selection inside dotted reference: "
+                               << selNodep->prettyNameQ());
                 return;
             }
-            m_unlinkedTxt.replace(pos, replacestr.length(),
-                                  baseName + "__BRA__" + index + "__KET__");
-        } else {
-            nodep->v3error("Could not expand constant selection inside dotted reference: "
-                           << nodep->selp()->prettyNameQ());
-            return;
+        }
+
+        // If we couldn't replace in m_unlinkedTxt (visiting outside UnlinkedRef context),
+        // try to find a matching interface port variable
+        if (m_unlinkedTxt.empty() || m_unlinkedTxt.find(placeholder) != string::npos) {
+            if (m_modp && !elementIndices.empty()) {
+                const string elementName = baseName + elementIndices;
+                for (AstNode* stmtp = m_modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                    const AstVar* const portVarp = VN_CAST(stmtp, Var);
+                    if (!isIfacePortVar(portVarp)) continue;
+                    AstIfaceRefDType* portIrefp
+                        = VN_CAST(portVarp->subDTypep(), IfaceRefDType);
+                    if (!portIrefp && arraySubDTypep(portVarp->subDTypep())) {
+                        portIrefp
+                            = VN_CAST(arraySubDTypep(portVarp->subDTypep()), IfaceRefDType);
+                    }
+                    if (!portIrefp) continue;
+                    const AstNodeModule* ifaceModp = portIrefp->ifaceViaCellp();
+                    if (!ifaceModp) ifaceModp = portIrefp->ifacep();
+                    if (!ifaceModp) continue;
+                    const AstVar* matchp = findVarByNameInModule(ifaceModp, nodep->name());
+                    if (!matchp) {
+                        matchp = findVarByNameInModule(ifaceModp, baseName);
+                        if (!matchp) {
+                            matchp = findVarByNameInModule(ifaceModp, baseName + viftopSuffix);
+                        }
+                    }
+                    if (!matchp) continue;
+                    AstVarXRef* const newp = new AstVarXRef{
+                        nodep->fileline(), elementName, portVarp->name(), VAccess::READ};
+                    nodep->replaceWith(newp);
+                    VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                    return;
+                }
+            }
+            if (m_unlinkedTxt.empty()) {
+                UINFO(9, "Skipping unlinked text replacement for " << nodep << endl);
+            }
         }
     }
 
