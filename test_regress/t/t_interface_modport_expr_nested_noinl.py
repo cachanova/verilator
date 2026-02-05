@@ -10,8 +10,9 @@
 import vltest_bootstrap
 
 test.scenarios('simulator')
+test.top_filename = "t/t_interface_modport_expr_nested.v"
 
-test.compile(verilator_flags2=["--binary"])
+test.compile(verilator_flags2=["--binary", "-fno-inline"])
 
 test.execute()
 
